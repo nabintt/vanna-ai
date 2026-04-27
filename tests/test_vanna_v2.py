@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import pandas as pd
-from vanna.core.llm import LlmResponse
+from vanna.core.llm import LlmMessage, LlmResponse
 from vanna.core.tool import ToolSchema
 from vanna.core.user import User
 
 from app.vanna_v2 import (
+    REQUEST_SCHEMA_CONTEXT_MARKER,
     SchemaAwareLlmContextEnhancer,
     build_schema_catalog,
     coerce_text_tool_calls,
@@ -201,3 +202,27 @@ def test_schema_aware_enhancer_injects_ddl_docs_and_examples():
     assert "`public.leaderboard_past` columns: player_id, skill, rank_position" in prompt
     assert "Use leaderboard tables carefully" in prompt
     assert 'SELECT "player_id", "skill", "rank_position"' in prompt
+
+
+def test_schema_aware_enhancer_appends_schema_to_user_message():
+    vn = FakeSchemaAwareVanna()
+    enhancer = SchemaAwareLlmContextEnhancer(vn, agent_memory=None)
+    user = User(
+        id="u1",
+        username="analyst",
+        email="analyst@example.com",
+        group_memberships=["user"],
+    )
+
+    messages = [
+        LlmMessage(role="user", content="show me leaderboard_past skill rankings"),
+        LlmMessage(role="assistant", content="Thinking..."),
+        LlmMessage(role="user", content="show me leaderboard_past skill rankings"),
+    ]
+
+    enhanced_messages = asyncio.run(enhancer.enhance_user_messages(messages, user))
+
+    assert enhanced_messages[-1].content is not None
+    assert REQUEST_SCHEMA_CONTEXT_MARKER in enhanced_messages[-1].content
+    assert 'CREATE TABLE "public"."leaderboard_past"' in enhanced_messages[-1].content
+    assert "Use the following real database schema while answering this request." in enhanced_messages[-1].content

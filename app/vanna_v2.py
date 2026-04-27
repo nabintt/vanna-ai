@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import HTMLResponse, StreamingResponse
 from vanna import Agent, AgentConfig
 from vanna.core.enhancer import DefaultLlmContextEnhancer, LlmContextEnhancer
-from vanna.core.llm import LlmRequest, LlmResponse, LlmStreamChunk
+from vanna.core.llm import LlmMessage, LlmRequest, LlmResponse, LlmStreamChunk
 from vanna.core.tool import ToolCall, ToolSchema
 from vanna.core.user import RequestContext, User
 from vanna.core.user.resolver import UserResolver
@@ -35,6 +35,7 @@ DDL_COLUMN_PATTERN = re.compile(
     re.MULTILINE,
 )
 DDL_SKIP_TOKENS = {"create", "table", "primary", "constraint", "foreign", "unique", "check"}
+REQUEST_SCHEMA_CONTEXT_MARKER = "[Attached schema context for this request]"
 
 
 @dataclass(frozen=True)
@@ -193,17 +194,10 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
         user: User,
     ) -> str:
         prompt = await self.base_enhancer.enhance_system_prompt(system_prompt, user_message, user)
-
-        related_ddl = dedupe_text_items(safe_list(self.vn.get_related_ddl, question=user_message))
-        if len(related_ddl) < 3:
-            fallback_ddl = [entry.ddl for entry in search_schema_catalog(self.schema_catalog, user_message)]
-            related_ddl = dedupe_text_items([*related_ddl, *fallback_ddl])
-
-        related_docs = dedupe_text_items(
-            safe_list(self.vn.get_related_documentation, question=user_message)
-        )
-        similar_pairs = dedupe_question_sql_pairs(
-            safe_list(self.vn.get_similar_question_sql, question=user_message)
+        context_bundle = build_schema_context_bundle(
+            vn=self.vn,
+            schema_catalog=self.schema_catalog,
+            question=user_message,
         )
 
         prompt_parts = [
@@ -217,19 +211,77 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             "- If the schema context is still insufficient, prefer a read-only metadata query against `information_schema` or relevant catalog views before guessing.",
         ]
 
-        schema_section = format_schema_context(related_ddl)
+        schema_section = format_schema_context(context_bundle["related_ddl"])
         if schema_section:
             prompt_parts.extend(["", "## Relevant Schema", schema_section])
 
-        documentation_section = format_documentation_context(related_docs)
+        documentation_section = format_documentation_context(context_bundle["related_docs"])
         if documentation_section:
             prompt_parts.extend(["", "## Relevant Documentation", documentation_section])
 
-        examples_section = format_question_sql_examples(similar_pairs)
+        examples_section = format_question_sql_examples(context_bundle["similar_pairs"])
         if examples_section:
             prompt_parts.extend(["", "## Similar Successful SQL Patterns", examples_section])
 
         return "\n".join(prompt_parts)
+
+    async def enhance_user_messages(
+        self,
+        messages: list[LlmMessage],
+        user: User,
+    ) -> list[LlmMessage]:
+        messages = await self.base_enhancer.enhance_user_messages(messages, user)
+        if not messages:
+            return messages
+
+        last_user_index = next(
+            (index for index in range(len(messages) - 1, -1, -1) if messages[index].role == "user"),
+            None,
+        )
+        if last_user_index is None:
+            return messages
+
+        original_message = messages[last_user_index]
+        base_content = original_message.content or ""
+        if REQUEST_SCHEMA_CONTEXT_MARKER in base_content:
+            return messages
+
+        context_bundle = build_schema_context_bundle(
+            vn=self.vn,
+            schema_catalog=self.schema_catalog,
+            question=base_content,
+        )
+        request_context = format_request_schema_context(context_bundle)
+        if not request_context:
+            return messages
+
+        updated_messages = list(messages)
+        updated_messages[last_user_index] = LlmMessage(
+            role=original_message.role,
+            content=f"{base_content.rstrip()}\n\n{request_context}",
+            tool_calls=original_message.tool_calls,
+            tool_call_id=original_message.tool_call_id,
+        )
+        return updated_messages
+
+
+def build_schema_context_bundle(
+    vn: Any,
+    schema_catalog: list[SchemaCatalogEntry],
+    question: str,
+) -> dict[str, Any]:
+    related_ddl = dedupe_text_items(safe_list(vn.get_related_ddl, question=question))
+    if len(related_ddl) < 3:
+        fallback_ddl = [entry.ddl for entry in search_schema_catalog(schema_catalog, question)]
+        related_ddl = dedupe_text_items([*related_ddl, *fallback_ddl])
+
+    return {
+        "related_ddl": related_ddl,
+        "related_docs": dedupe_text_items(safe_list(vn.get_related_documentation, question=question)),
+        "similar_pairs": dedupe_question_sql_pairs(
+            safe_list(vn.get_similar_question_sql, question=question)
+        ),
+    }
 
 
 def safe_list(method: Any, **kwargs: Any) -> list[Any]:
@@ -424,6 +476,37 @@ def format_question_sql_examples(pairs: list[dict[str, str]]) -> str:
         lines.append(f"Question: {pair['question']}")
         lines.append(f"```sql\n{truncate_text(pair['sql'], 800)}\n```")
     return "\n".join(lines)
+
+
+def format_request_schema_context(context_bundle: dict[str, Any]) -> str:
+    related_ddl = context_bundle.get("related_ddl", [])
+    related_docs = context_bundle.get("related_docs", [])
+    similar_pairs = context_bundle.get("similar_pairs", [])
+
+    parts = [REQUEST_SCHEMA_CONTEXT_MARKER]
+
+    schema_section = format_schema_context(related_ddl)
+    if schema_section:
+        parts.extend(
+            [
+                "Use the following real database schema while answering this request.",
+                "## Table Schema",
+                schema_section,
+            ]
+        )
+
+    documentation_section = format_documentation_context(related_docs)
+    if documentation_section:
+        parts.extend(["## Business Notes", documentation_section])
+
+    examples_section = format_question_sql_examples(similar_pairs)
+    if examples_section:
+        parts.extend(["## Similar SQL Examples", examples_section])
+
+    if len(parts) == 1:
+        return ""
+
+    return "\n".join(parts)
 
 
 class LocalAdminUserResolver(UserResolver):
