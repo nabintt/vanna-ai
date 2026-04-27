@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: local-vanna-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vanna_local
+      POSTGRES_USER: vanna
+      POSTGRES_PASSWORD: vanna
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

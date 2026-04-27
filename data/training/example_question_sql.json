@@ -1,0 +1,14 @@
+[
+  {
+    "question": "Show 10 rows from public.orders.",
+    "sql": "SELECT * FROM \"public\".\"orders\" LIMIT 10;"
+  },
+  {
+    "question": "How many rows are in public.orders?",
+    "sql": "SELECT COUNT(*) AS row_count FROM \"public\".\"orders\";"
+  },
+  {
+    "question": "List the first 10 values for id, customer_name in public.orders.",
+    "sql": "SELECT \"id\", \"customer_name\" FROM \"public\".\"orders\" LIMIT 10;"
+  }
+]
