@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import traceback
+from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
 from vanna import Agent, AgentConfig
+from vanna.core.enhancer import DefaultLlmContextEnhancer, LlmContextEnhancer
 from vanna.core.llm import LlmRequest, LlmResponse, LlmStreamChunk
 from vanna.core.tool import ToolCall, ToolSchema
 from vanna.core.user import RequestContext, User
@@ -19,7 +22,27 @@ from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse
 
 from app.config import Settings
 
+logger = logging.getLogger(__name__)
+
 JSON_CODE_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+SEARCH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+DDL_TABLE_PATTERN = re.compile(
+    r"CREATE\s+TABLE\s+(?:\"|`)?(?P<schema>[A-Za-z0-9_]+)(?:\"|`)?\.(?:\"|`)?(?P<table>[A-Za-z0-9_]+)(?:\"|`)?",
+    re.IGNORECASE,
+)
+DDL_COLUMN_PATTERN = re.compile(
+    r"^\s*(?:\"|`)?(?P<name>[A-Za-z0-9_]+)(?:\"|`)?\s+[A-Za-z]",
+    re.MULTILINE,
+)
+DDL_SKIP_TOKENS = {"create", "table", "primary", "constraint", "foreign", "unique", "check"}
+
+
+@dataclass(frozen=True)
+class SchemaCatalogEntry:
+    table_name: str
+    columns: tuple[str, ...]
+    ddl: str
+    search_terms: frozenset[str]
 
 
 class OllamaToolCallFallbackService(OllamaLlmService):
@@ -155,6 +178,254 @@ def decode_json_objects(candidate: str) -> list[dict[str, Any]]:
     return payloads
 
 
+class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
+    """Inject relevant DDL, docs, and examples into the SQL-generation prompt."""
+
+    def __init__(self, vn: Any, agent_memory: Any):
+        self.vn = vn
+        self.base_enhancer = DefaultLlmContextEnhancer(agent_memory)
+        self.schema_catalog = build_schema_catalog(vn)
+
+    async def enhance_system_prompt(
+        self,
+        system_prompt: str,
+        user_message: str,
+        user: User,
+    ) -> str:
+        prompt = await self.base_enhancer.enhance_system_prompt(system_prompt, user_message, user)
+
+        related_ddl = dedupe_text_items(safe_list(self.vn.get_related_ddl, question=user_message))
+        if len(related_ddl) < 3:
+            fallback_ddl = [entry.ddl for entry in search_schema_catalog(self.schema_catalog, user_message)]
+            related_ddl = dedupe_text_items([*related_ddl, *fallback_ddl])
+
+        related_docs = dedupe_text_items(
+            safe_list(self.vn.get_related_documentation, question=user_message)
+        )
+        similar_pairs = dedupe_question_sql_pairs(
+            safe_list(self.vn.get_similar_question_sql, question=user_message)
+        )
+
+        prompt_parts = [
+            prompt,
+            "",
+            "## SQL Generation Rules",
+            "- Use only tables and columns that appear in the schema context or successful SQL examples below.",
+            "- Do not invent columns such as `username`, `name`, or `skill` unless they are explicitly present in the provided schema.",
+            "- If a SQL execution error mentions a missing table or column, treat it as a schema mismatch and correct the query before drawing conclusions.",
+            "- Never conclude that a table is empty just because a previous SQL statement failed.",
+            "- If the schema context is still insufficient, prefer a read-only metadata query against `information_schema` or relevant catalog views before guessing.",
+        ]
+
+        schema_section = format_schema_context(related_ddl)
+        if schema_section:
+            prompt_parts.extend(["", "## Relevant Schema", schema_section])
+
+        documentation_section = format_documentation_context(related_docs)
+        if documentation_section:
+            prompt_parts.extend(["", "## Relevant Documentation", documentation_section])
+
+        examples_section = format_question_sql_examples(similar_pairs)
+        if examples_section:
+            prompt_parts.extend(["", "## Similar Successful SQL Patterns", examples_section])
+
+        return "\n".join(prompt_parts)
+
+
+def safe_list(method: Any, **kwargs: Any) -> list[Any]:
+    try:
+        result = method(**kwargs)
+    except Exception:
+        logger.warning("Failed to load Vanna schema context", exc_info=True)
+        return []
+    if not isinstance(result, list):
+        return []
+    return result
+
+
+def dedupe_text_items(items: list[Any], limit: int = 5) -> list[str]:
+    results: list[str] = []
+    seen: set[str] = set()
+
+    for item in items:
+        if isinstance(item, dict):
+            value = str(item.get("ddl") or item.get("documentation") or item.get("content") or "").strip()
+        else:
+            value = str(item).strip()
+        if not value:
+            continue
+
+        fingerprint = " ".join(value.split())
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        results.append(value)
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def dedupe_question_sql_pairs(items: list[Any], limit: int = 4) -> list[dict[str, str]]:
+    results: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        sql = str(item.get("sql") or "").strip()
+        if not question or not sql:
+            continue
+
+        fingerprint = (" ".join(question.split()), " ".join(sql.split()))
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        results.append({"question": question, "sql": sql})
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def build_schema_catalog(vn: Any) -> list[SchemaCatalogEntry]:
+    try:
+        training_df = vn.get_training_data()
+    except Exception:
+        logger.warning("Failed to load training data for schema catalog", exc_info=True)
+        return []
+
+    if training_df is None or training_df.empty:
+        return []
+
+    catalog: list[SchemaCatalogEntry] = []
+    ddl_rows = training_df.fillna("")
+    ddl_rows = ddl_rows[ddl_rows["training_data_type"].astype(str).str.lower() == "ddl"]
+
+    for ddl in ddl_rows["content"].astype(str).tolist():
+        ddl = ddl.strip()
+        if not ddl:
+            continue
+
+        table_name = extract_table_name_from_ddl(ddl)
+        columns = extract_column_names_from_ddl(ddl)
+        search_terms = tokenize_schema_text(table_name)
+        for column in columns:
+            search_terms.update(tokenize_schema_text(column))
+
+        catalog.append(
+            SchemaCatalogEntry(
+                table_name=table_name,
+                columns=tuple(columns),
+                ddl=ddl,
+                search_terms=frozenset(search_terms),
+            )
+        )
+
+    return catalog
+
+
+def extract_table_name_from_ddl(ddl: str) -> str:
+    match = DDL_TABLE_PATTERN.search(ddl)
+    if not match:
+        return "unknown_table"
+    return f"{match.group('schema')}.{match.group('table')}"
+
+
+def extract_column_names_from_ddl(ddl: str) -> list[str]:
+    column_names: list[str] = []
+    for match in DDL_COLUMN_PATTERN.finditer(ddl):
+        name = match.group("name")
+        if name.lower() in DDL_SKIP_TOKENS:
+            continue
+        column_names.append(name)
+    return column_names
+
+
+def tokenize_schema_text(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw_token in SEARCH_TOKEN_PATTERN.findall(text.lower()):
+        if len(raw_token) < 2:
+            continue
+        tokens.add(raw_token)
+        if "_" in raw_token:
+            tokens.update(part for part in raw_token.split("_") if len(part) >= 2)
+    return tokens
+
+
+def search_schema_catalog(
+    catalog: list[SchemaCatalogEntry],
+    question: str,
+    limit: int = 4,
+) -> list[SchemaCatalogEntry]:
+    if not catalog:
+        return []
+
+    question_lower = question.lower()
+    question_tokens = tokenize_schema_text(question)
+    scored_entries: list[tuple[int, SchemaCatalogEntry]] = []
+
+    for entry in catalog:
+        score = 0
+        if entry.table_name != "unknown_table" and entry.table_name.lower() in question_lower:
+            score += 10
+
+        overlap = question_tokens & set(entry.search_terms)
+        if overlap:
+            score += len(overlap)
+
+        if any(column.lower() in question_lower for column in entry.columns):
+            score += 2
+
+        if score > 0:
+            scored_entries.append((score, entry))
+
+    scored_entries.sort(key=lambda item: (-item[0], item[1].table_name))
+    return [entry for _, entry in scored_entries[:limit]]
+
+
+def truncate_text(value: str, limit: int) -> str:
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3].rstrip() + "..."
+
+
+def format_schema_context(related_ddl: list[str]) -> str:
+    if not related_ddl:
+        return ""
+
+    lines: list[str] = []
+    for ddl in related_ddl[:4]:
+        table_name = extract_table_name_from_ddl(ddl)
+        columns = extract_column_names_from_ddl(ddl)
+        if columns:
+            column_preview = ", ".join(columns[:12])
+            if len(columns) > 12:
+                column_preview += ", ..."
+            lines.append(f"- `{table_name}` columns: {column_preview}")
+        lines.append(f"```sql\n{truncate_text(ddl, 1600)}\n```")
+    return "\n".join(lines)
+
+
+def format_documentation_context(related_docs: list[str]) -> str:
+    if not related_docs:
+        return ""
+    return "\n".join(f"- {truncate_text(doc, 500)}" for doc in related_docs[:4])
+
+
+def format_question_sql_examples(pairs: list[dict[str, str]]) -> str:
+    if not pairs:
+        return ""
+
+    lines: list[str] = []
+    for pair in pairs[:3]:
+        lines.append(f"Question: {pair['question']}")
+        lines.append(f"```sql\n{truncate_text(pair['sql'], 800)}\n```")
+    return "\n".join(lines)
+
+
 class LocalAdminUserResolver(UserResolver):
     """Treat local browser sessions as fully privileged local users."""
 
@@ -188,6 +459,7 @@ def build_vanna_v2_chat_handler(vn: Any, settings: Settings) -> ChatHandler:
         tool_registry=legacy_adapter,
         agent_memory=legacy_adapter,
         user_resolver=LocalAdminUserResolver(),
+        llm_context_enhancer=SchemaAwareLlmContextEnhancer(vn, legacy_adapter),
         config=AgentConfig(
             stream_responses=True,
             include_thinking_indicators=False,

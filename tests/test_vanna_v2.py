@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import pandas as pd
 from vanna.core.llm import LlmResponse
 from vanna.core.tool import ToolSchema
+from vanna.core.user import User
 
-from app.vanna_v2 import coerce_text_tool_calls, extract_text_tool_calls
+from app.vanna_v2 import (
+    SchemaAwareLlmContextEnhancer,
+    build_schema_catalog,
+    coerce_text_tool_calls,
+    extract_text_tool_calls,
+    search_schema_catalog,
+)
 
 
 def build_tool_schemas() -> list[ToolSchema]:
@@ -109,3 +118,86 @@ def test_coerce_text_tool_calls_leaves_normal_text_alone():
 
     assert normalized.content == "Here is a plain-language answer."
     assert normalized.tool_calls is None
+
+
+class FakeSchemaAwareVanna:
+    def get_training_data(self):
+        return pd.DataFrame(
+            [
+                {
+                    "id": "ddl-1",
+                    "question": None,
+                    "content": (
+                        'CREATE TABLE "public"."leaderboard_past" (\n'
+                        '    "player_id" uuid NOT NULL,\n'
+                        '    "skill" numeric,\n'
+                        '    "rank_position" integer\n'
+                        ");"
+                    ),
+                    "training_data_type": "ddl",
+                },
+                {
+                    "id": "ddl-2",
+                    "question": None,
+                    "content": (
+                        'CREATE TABLE "public"."player" (\n'
+                        '    "id" uuid NOT NULL,\n'
+                        '    "username" varchar(255)\n'
+                        ");"
+                    ),
+                    "training_data_type": "ddl",
+                },
+            ]
+        )
+
+    def get_related_ddl(self, question: str):
+        return []
+
+    def get_related_documentation(self, question: str):
+        return [
+            "Use leaderboard tables carefully and only reference columns that actually exist in the table."
+        ]
+
+    def get_similar_question_sql(self, question: str):
+        return [
+            {
+                "question": "Show leaderboard ranks with skill values.",
+                "sql": 'SELECT "player_id", "skill", "rank_position" FROM "public"."leaderboard_past";',
+            }
+        ]
+
+
+def test_schema_catalog_keyword_fallback_finds_relevant_table():
+    vn = FakeSchemaAwareVanna()
+
+    catalog = build_schema_catalog(vn)
+    matches = search_schema_catalog(catalog, "show me leaderboard_past skill rankings")
+
+    assert matches
+    assert matches[0].table_name == "public.leaderboard_past"
+    assert "skill" in matches[0].columns
+
+
+def test_schema_aware_enhancer_injects_ddl_docs_and_examples():
+    vn = FakeSchemaAwareVanna()
+    enhancer = SchemaAwareLlmContextEnhancer(vn, agent_memory=None)
+    user = User(
+        id="u1",
+        username="analyst",
+        email="analyst@example.com",
+        group_memberships=["user"],
+    )
+
+    prompt = asyncio.run(
+        enhancer.enhance_system_prompt(
+            "Base system prompt.",
+            "show me leaderboard_past skill rankings",
+            user,
+        )
+    )
+
+    assert "## SQL Generation Rules" in prompt
+    assert 'CREATE TABLE "public"."leaderboard_past"' in prompt
+    assert "`public.leaderboard_past` columns: player_id, skill, rank_position" in prompt
+    assert "Use leaderboard tables carefully" in prompt
+    assert 'SELECT "player_id", "skill", "rank_position"' in prompt
