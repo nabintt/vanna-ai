@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, validation_alias="APP_PORT")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
+    vanna_ui_title: str = Field(default="Local Vanna AI", validation_alias="VANNA_UI_TITLE")
+    vanna_ui_subtitle: str = Field(
+        default="Ask questions in natural language using the Vanna 2 chat interface.",
+        validation_alias="VANNA_UI_SUBTITLE",
+    )
+    vanna_ui_cdn_url: str = Field(
+        default="https://img.vanna.ai/vanna-components.js",
+        validation_alias="VANNA_UI_CDN_URL",
+    )
+
     ollama_host: str = Field(default="http://localhost:11434", validation_alias="OLLAMA_HOST")
     ollama_model: str = Field(default="llama3.2", validation_alias="OLLAMA_MODEL")
     ollama_embed_model: str | None = Field(default=None, validation_alias="OLLAMA_EMBED_MODEL")

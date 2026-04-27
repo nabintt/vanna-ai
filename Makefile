@@ -2,14 +2,13 @@
 
 VENV := .venv
 PYTHON := $(VENV)/bin/python
-PIP := $(VENV)/bin/pip
 
 .PHONY: setup check-ollama train run dev test
 
 setup:
 >python3 -m venv $(VENV)
->$(PIP) install --upgrade pip
->$(PIP) install -r requirements.txt
+>$(PYTHON) -m pip install --upgrade pip
+>$(PYTHON) -m pip install -r requirements.txt
 
 check-ollama:
 >$(PYTHON) scripts/check_ollama.py

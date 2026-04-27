@@ -4,8 +4,8 @@ import logging
 from typing import Any
 
 import httpx
-from vanna.chromadb import ChromaDB_VectorStore
-from vanna.ollama import Ollama
+from vanna.legacy.chromadb import ChromaDB_VectorStore
+from vanna.legacy.ollama import Ollama
 
 from app.config import Settings
 

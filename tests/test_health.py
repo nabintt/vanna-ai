@@ -47,6 +47,7 @@ def build_test_app() -> TestClient:
         settings=settings,
         db=FakeDatabase(),
         vn=FakeVanna(),
+        vanna_v2_chat_handler=object(),
         started_at=datetime.now(UTC),
     )
     app = create_app(services=services, settings=settings)
@@ -54,10 +55,9 @@ def build_test_app() -> TestClient:
 
 
 def test_health_endpoint_returns_ok():
-    client = build_test_app()
-
-    response = client.get("/health")
-    payload = response.json()
+    with build_test_app() as client:
+        response = client.get("/health")
+        payload = response.json()
 
     assert response.status_code == 200
     assert payload["status"] == "ok"
@@ -65,21 +65,20 @@ def test_health_endpoint_returns_ok():
 
 
 def test_ready_endpoint_returns_success_with_mocked_ollama():
-    client = build_test_app()
-
-    with patch(
-        "app.health.inspect_ollama",
-        return_value={
-            "ready": True,
-            "reachable": True,
-            "configured_host": "http://localhost:11434",
-            "requested_models": ["llama3.2:latest"],
-            "installed_models": ["llama3.2:latest"],
-            "missing_models": [],
-            "error": None,
-        },
-    ):
-        response = client.get("/ready")
+    with build_test_app() as client:
+        with patch(
+            "app.health.inspect_ollama",
+            return_value={
+                "ready": True,
+                "reachable": True,
+                "configured_host": "http://localhost:11434",
+                "requested_models": ["llama3.2:latest"],
+                "installed_models": ["llama3.2:latest"],
+                "missing_models": [],
+                "error": None,
+            },
+        ):
+            response = client.get("/ready")
 
     assert response.status_code == 200
     assert response.json()["status"] == "ready"

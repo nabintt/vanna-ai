@@ -23,6 +23,21 @@ def test_settings_load_from_environment(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_vanna_ui_settings_load_from_environment(monkeypatch):
+    monkeypatch.setenv("VANNA_UI_TITLE", "My Vanna")
+    monkeypatch.setenv("VANNA_UI_SUBTITLE", "My Subtitle")
+    monkeypatch.setenv("VANNA_UI_CDN_URL", "https://cdn.example.com/vanna.js")
+
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    assert settings.vanna_ui_title == "My Vanna"
+    assert settings.vanna_ui_subtitle == "My Subtitle"
+    assert settings.vanna_ui_cdn_url == "https://cdn.example.com/vanna.js"
+
+    get_settings.cache_clear()
+
+
 def test_validate_database_config_raises_for_missing_values(tmp_path):
     settings = Settings(
         _env_file=None,

@@ -4,7 +4,7 @@ import json
 
 import pandas as pd
 import pytest
-from vanna.types import TrainingPlan, TrainingPlanItem
+from vanna.legacy.types import TrainingPlan, TrainingPlanItem
 
 from app.config import Settings
 from app.training import TrainingBootstrapError, bootstrap_training, ensure_training_ready

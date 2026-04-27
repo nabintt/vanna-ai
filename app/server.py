@@ -22,6 +22,7 @@ from app.training import (
     ensure_training_ready,
     summarize_training,
 )
+from app.vanna_v2 import build_vanna_v2_chat_handler, register_vanna_v2_routes
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class AppServices:
     settings: Settings
     db: DatabaseClient
     vn: Any
+    vanna_v2_chat_handler: Any
     started_at: datetime
 
 
@@ -79,6 +81,7 @@ def build_services(settings: Settings | None = None) -> AppServices:
         settings=settings,
         db=db,
         vn=vn,
+        vanna_v2_chat_handler=build_vanna_v2_chat_handler(vn, settings),
         started_at=datetime.now(UTC),
     )
 
@@ -112,6 +115,13 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    if services is not None:
+        # Allow dependency-injected apps to work even when a test client
+        # does not explicitly enter the lifespan context.
+        app.state.services = services
+
+    register_vanna_v2_routes(app, effective_settings)
 
     @app.get("/health")
     async def health(request: Request) -> dict[str, Any]:

@@ -1,14 +1,366 @@
 [
   {
-    "question": "Show 10 rows from public.orders.",
-    "sql": "SELECT * FROM \"public\".\"orders\" LIMIT 10;"
+    "question": "Show 10 rows from public.player.",
+    "sql": "SELECT * FROM \"public\".\"player\" LIMIT 10;"
   },
   {
-    "question": "How many rows are in public.orders?",
-    "sql": "SELECT COUNT(*) AS row_count FROM \"public\".\"orders\";"
+    "question": "How many players are in public.player?",
+    "sql": "SELECT COUNT(*) AS player_count FROM \"public\".\"player\";"
   },
   {
-    "question": "List the first 10 values for id, customer_name in public.orders.",
-    "sql": "SELECT \"id\", \"customer_name\" FROM \"public\".\"orders\" LIMIT 10;"
+    "question": "How many players registered in the last 30 days?",
+    "sql": "SELECT COUNT(*) AS player_count FROM \"public\".\"player\" WHERE \"created_at\" >= CURRENT_DATE - INTERVAL '30 days';"
+  },
+  {
+    "question": "Show daily player registrations for the last 30 days.",
+    "sql": "SELECT DATE_TRUNC('day', \"created_at\") AS registration_day, COUNT(*) AS player_count FROM \"public\".\"player\" WHERE \"created_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY 1 ORDER BY 1;"
+  },
+  {
+    "question": "How many players signed up with each login provider?",
+    "sql": "SELECT lp.\"name\" AS provider, COUNT(*) AS player_count FROM \"public\".\"player\" p LEFT JOIN \"public\".\"login_provider\" lp ON p.\"provider_id\" = lp.\"id\" GROUP BY lp.\"name\" ORDER BY player_count DESC;"
+  },
+  {
+    "question": "How many players are in each availability status?",
+    "sql": "SELECT a.\"name\" AS availability_status, COUNT(*) AS player_count FROM \"public\".\"player\" p LEFT JOIN \"public\".\"availability\" a ON p.\"availability_id\" = a.\"id\" GROUP BY a.\"name\" ORDER BY player_count DESC;"
+  },
+  {
+    "question": "How many players are in each gameplay status?",
+    "sql": "SELECT gs.\"name\" AS gameplay_status, COUNT(*) AS player_count FROM \"public\".\"player\" p LEFT JOIN \"public\".\"gameplay_status\" gs ON p.\"gameplay_status_id\" = gs.\"id\" GROUP BY gs.\"name\" ORDER BY player_count DESC;"
+  },
+  {
+    "question": "What are the top 20 countries by player count?",
+    "sql": "SELECT c.\"name\" AS country, COUNT(*) AS player_count FROM \"public\".\"player\" p LEFT JOIN \"public\".\"country\" c ON p.\"country_id\" = c.\"id\" GROUP BY c.\"name\" ORDER BY player_count DESC NULLS LAST LIMIT 20;"
+  },
+  {
+    "question": "How many players are in each continent?",
+    "sql": "SELECT c.\"name\" AS continent, COUNT(*) AS player_count FROM \"public\".\"player\" p LEFT JOIN \"public\".\"continent\" c ON p.\"continent_id\" = c.\"id\" GROUP BY c.\"name\" ORDER BY player_count DESC NULLS LAST;"
+  },
+  {
+    "question": "How many players are on each OS and version code?",
+    "sql": "SELECT \"os\", \"version_code\", COUNT(*) AS player_count FROM \"public\".\"player\" GROUP BY \"os\", \"version_code\" ORDER BY player_count DESC;"
+  },
+  {
+    "question": "How many players updated their username at least once?",
+    "sql": "SELECT COUNT(*) AS players_with_username_updates FROM \"public\".\"player\" WHERE COALESCE(\"username_update_count\", 0) > 0;"
+  },
+  {
+    "question": "How many players created in the last 30 days never logged in?",
+    "sql": "SELECT COUNT(*) AS never_logged_in_players FROM \"public\".\"player\" p WHERE p.\"created_at\" >= CURRENT_DATE - INTERVAL '30 days' AND NOT EXISTS (SELECT 1 FROM \"public\".\"player_login\" pl WHERE pl.\"player_id\" = p.\"id\");"
+  },
+  {
+    "question": "Show daily login events for the last 30 days.",
+    "sql": "SELECT DATE_TRUNC('day', \"logged_in_at\") AS login_day, COUNT(*) AS login_events FROM \"public\".\"player_login\" WHERE \"logged_in_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY 1 ORDER BY 1;"
+  },
+  {
+    "question": "Who are the top 20 players by login events in the last 30 days?",
+    "sql": "SELECT p.\"id\" AS player_id, p.\"username\", COUNT(*) AS login_events FROM \"public\".\"player_login\" pl JOIN \"public\".\"player\" p ON pl.\"player_id\" = p.\"id\" WHERE pl.\"logged_in_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY p.\"id\", p.\"username\" ORDER BY login_events DESC LIMIT 20;"
+  },
+  {
+    "question": "How many linked accounts exist for each provider?",
+    "sql": "SELECT lp.\"name\" AS provider, COUNT(*) AS linked_account_count FROM \"public\".\"linked_account\" la LEFT JOIN \"public\".\"login_provider\" lp ON la.\"provider_id\" = lp.\"id\" GROUP BY lp.\"name\" ORDER BY linked_account_count DESC;"
+  },
+  {
+    "question": "How many players use each background and card theme combination?",
+    "sql": "SELECT COALESCE(\"background_theme\", 'UNKNOWN') AS background_theme, COALESCE(\"card_theme\", 'UNKNOWN') AS card_theme, COUNT(*) AS player_count FROM \"public\".\"view_user_pref\" GROUP BY 1, 2 ORDER BY player_count DESC;"
+  },
+  {
+    "question": "How many user preference rows are in each game speed?",
+    "sql": "SELECT \"game_speed\", COUNT(*) AS preference_count FROM \"public\".\"user_preference\" GROUP BY \"game_speed\" ORDER BY preference_count DESC;"
+  },
+  {
+    "question": "How many friend requests are in each status?",
+    "sql": "SELECT frs.\"name\" AS request_status, COUNT(*) AS request_count FROM \"public\".\"friend_requests\" fr LEFT JOIN \"public\".\"friend_request_status\" frs ON fr.\"status_id\" = frs.\"id\" GROUP BY frs.\"name\" ORDER BY request_count DESC;"
+  },
+  {
+    "question": "Which 20 players sent the most friend requests?",
+    "sql": "SELECT p.\"id\" AS player_id, p.\"username\", COUNT(*) AS sent_request_count FROM \"public\".\"friend_requests\" fr JOIN \"public\".\"player\" p ON fr.\"sender_id\" = p.\"id\" GROUP BY p.\"id\", p.\"username\" ORDER BY sent_request_count DESC LIMIT 20;"
+  },
+  {
+    "question": "Show friendships created by month.",
+    "sql": "SELECT DATE_TRUNC('month', \"connected_date\") AS connected_month, COUNT(*) AS friendship_count FROM \"public\".\"friend\" GROUP BY 1 ORDER BY 1;"
+  },
+  {
+    "question": "How many referrals are in each status?",
+    "sql": "SELECT COALESCE(\"status\", 'UNKNOWN') AS referral_status, COUNT(*) AS referral_count FROM \"public\".\"referral\" GROUP BY 1 ORDER BY referral_count DESC;"
+  },
+  {
+    "question": "Which 20 players referred the most other players?",
+    "sql": "SELECT p.\"id\" AS player_id, p.\"username\", COUNT(*) AS referral_count FROM \"public\".\"referral\" r JOIN \"public\".\"player\" p ON r.\"referred_by\" = p.\"id\" GROUP BY p.\"id\", p.\"username\" ORDER BY referral_count DESC LIMIT 20;"
+  },
+  {
+    "question": "Show referral claims by day for the last 30 days.",
+    "sql": "SELECT DATE_TRUNC('day', \"claimed_at\") AS claim_day, COUNT(*) AS claimed_referrals FROM \"public\".\"referral\" WHERE \"claimed_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY 1 ORDER BY 1;"
+  },
+  {
+    "question": "How many pending referrals are older than 30 days?",
+    "sql": "SELECT COUNT(*) AS stale_pending_referrals FROM \"public\".\"referral\" WHERE \"status\" = 'PENDING' AND \"created_at\" < CURRENT_DATE - INTERVAL '30 days';"
+  },
+  {
+    "question": "Show games started by day for the last 30 days.",
+    "sql": "SELECT DATE_TRUNC('day', \"started_at\") AS game_day, COUNT(*) AS games_started FROM \"public\".\"game\" WHERE \"started_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY 1 ORDER BY 1;"
+  },
+  {
+    "question": "How many games are in each game mode?",
+    "sql": "SELECT gm.\"name\" AS game_mode, COUNT(*) AS game_count FROM \"public\".\"game\" g LEFT JOIN \"public\".\"game_mode\" gm ON g.\"game_mode_id\" = gm.\"id\" GROUP BY gm.\"name\" ORDER BY game_count DESC;"
+  },
+  {
+    "question": "How many games are in each game scope?",
+    "sql": "SELECT gs.\"name\" AS game_scope, COUNT(*) AS game_count FROM \"public\".\"game\" g LEFT JOIN \"public\".\"game_scope\" gs ON g.\"game_scope_id\" = gs.\"id\" GROUP BY gs.\"name\" ORDER BY game_count DESC;"
+  },
+  {
+    "question": "Show completed versus canceled games by game scope.",
+    "sql": "SELECT gs.\"name\" AS game_scope, SUM(CASE WHEN g.\"completed\" THEN 1 ELSE 0 END) AS completed_games, SUM(CASE WHEN g.\"canceled\" THEN 1 ELSE 0 END) AS canceled_games FROM \"public\".\"game\" g LEFT JOIN \"public\".\"game_scope\" gs ON g.\"game_scope_id\" = gs.\"id\" GROUP BY gs.\"name\" ORDER BY completed_games DESC;"
+  },
+  {
+    "question": "What is the average game duration by game mode?",
+    "sql": "SELECT gm.\"name\" AS game_mode, AVG(g.\"duration\") AS avg_duration FROM \"public\".\"game\" g LEFT JOIN \"public\".\"game_mode\" gm ON g.\"game_mode_id\" = gm.\"id\" WHERE g.\"duration\" IS NOT NULL GROUP BY gm.\"name\" ORDER BY avg_duration DESC NULLS LAST;"
+  },
+  {
+    "question": "What is the average score by game mode?",
+    "sql": "SELECT gm.\"name\" AS game_mode, AVG(g.\"score\") AS avg_score FROM \"public\".\"game\" g LEFT JOIN \"public\".\"game_mode\" gm ON g.\"game_mode_id\" = gm.\"id\" WHERE g.\"score\" IS NOT NULL GROUP BY gm.\"name\" ORDER BY avg_score DESC NULLS LAST;"
+  },
+  {
+    "question": "Who are the top 20 players by completed games?",
+    "sql": "SELECT p.\"id\" AS player_id, p.\"username\", COUNT(*) AS completed_games FROM \"public\".\"game\" g JOIN \"public\".\"player\" p ON g.\"player_id\" = p.\"id\" WHERE g.\"completed\" = TRUE GROUP BY p.\"id\", p.\"username\" ORDER BY completed_games DESC LIMIT 20;"
+  },
+  {
+    "question": "Show the rank distribution for completed games.",
+    "sql": "SELECT \"rank\", COUNT(*) AS game_count FROM \"public\".\"game\" WHERE \"completed\" = TRUE AND \"rank\" IS NOT NULL GROUP BY \"rank\" ORDER BY \"rank\";"
+  },
+  {
+    "question": "How many games were favorited by users versus the system?",
+    "sql": "SELECT SUM(CASE WHEN \"is_favorite_by_user\" THEN 1 ELSE 0 END) AS user_favorites, SUM(CASE WHEN \"is_favorite_by_system\" THEN 1 ELSE 0 END) AS system_favorites FROM \"public\".\"game\";"
+  },
+  {
+    "question": "Show the top 20 players by number of games played in their first 7 days.",
+    "sql": "SELECT \"Player ID\", \"Username\", \"Registration Date\", \"Number of Games in First 7 Days\" FROM \"public\".\"view_day7_games_played\" LIMIT 20;"
+  },
+  {
+    "question": "Show the top 20 players by number of games played in their first 3 days.",
+    "sql": "SELECT \"Player ID\", \"Username\", \"Registration Date\", \"Number of Games in First 3 Days\" FROM \"public\".\"view_day3_games_played\" LIMIT 20;"
+  },
+  {
+    "question": "Who are the top 50 players by current skill in the player_skills view?",
+    "sql": "SELECT ps.\"player_id\", p.\"username\", ps.\"mu\" AS skill_mu, ps.\"sigma\" AS skill_sigma, ps.\"total_games\", ps.\"total_completed\" FROM \"public\".\"player_skills\" ps LEFT JOIN \"public\".\"player\" p ON ps.\"player_id\" = p.\"id\" ORDER BY ps.\"mu\" DESC NULLS LAST LIMIT 50;"
+  },
+  {
+    "question": "What are the average skill and total games by login provider?",
+    "sql": "SELECT lp.\"name\" AS provider, AVG(ps.\"mu\") AS avg_skill_mu, AVG(ps.\"total_games\") AS avg_total_games FROM \"public\".\"player_skills\" ps JOIN \"public\".\"player\" p ON ps.\"player_id\" = p.\"id\" LEFT JOIN \"public\".\"login_provider\" lp ON p.\"provider_id\" = lp.\"id\" GROUP BY lp.\"name\" ORDER BY avg_skill_mu DESC NULLS LAST;"
+  },
+  {
+    "question": "Which 20 players have the highest 99th percentile matchmaking wait time?",
+    "sql": "SELECT ps.\"player_id\", p.\"username\", ps.\"wait_time_p99\", ps.\"max_wait_time\" FROM \"public\".\"player_skills\" ps LEFT JOIN \"public\".\"player\" p ON ps.\"player_id\" = p.\"id\" ORDER BY ps.\"wait_time_p99\" DESC NULLS LAST LIMIT 20;"
+  },
+  {
+    "question": "Show aggregated statistics by game mode and game scope for time_range_id 0.",
+    "sql": "SELECT gm.\"name\" AS game_mode, gs.\"name\" AS game_scope, COUNT(*) AS stat_rows, AVG(s.\"total_games\") AS avg_total_games, AVG(s.\"win_ratio\") AS avg_win_ratio, AVG(s.\"skill\") AS avg_skill FROM \"public\".\"statistics\" s LEFT JOIN \"public\".\"game_mode\" gm ON s.\"game_mode_id\" = gm.\"id\" LEFT JOIN \"public\".\"game_scope\" gs ON s.\"game_scope_id\" = gs.\"id\" WHERE s.\"time_range_id\" = 0 GROUP BY gm.\"name\", gs.\"name\" ORDER BY stat_rows DESC;"
+  },
+  {
+    "question": "How many achievement records exist for each metric?",
+    "sql": "SELECT m.\"name\" AS metric_name, COUNT(*) AS achievement_rows FROM \"public\".\"achievements\" a JOIN \"public\".\"metrics\" m ON a.\"metric_id\" = m.\"id\" GROUP BY m.\"name\" ORDER BY achievement_rows DESC;"
+  },
+  {
+    "question": "Show the top 20 world-ranked players for the SKILL metric.",
+    "sql": "SELECT a.\"world_rank\", p.\"id\" AS player_id, p.\"username\", gm.\"name\" AS game_mode, gs.\"name\" AS game_scope, a.\"skill\", a.\"world_percentile\" FROM \"public\".\"achievements\" a JOIN \"public\".\"metrics\" m ON a.\"metric_id\" = m.\"id\" JOIN \"public\".\"player\" p ON a.\"player_id\" = p.\"id\" LEFT JOIN \"public\".\"game_mode\" gm ON a.\"game_mode_id\" = gm.\"id\" LEFT JOIN \"public\".\"game_scope\" gs ON a.\"game_scope_id\" = gs.\"id\" WHERE m.\"name\" = 'SKILL' AND a.\"world_rank\" IS NOT NULL ORDER BY a.\"world_rank\" ASC LIMIT 20;"
+  },
+  {
+    "question": "Show the top 20 world-ranked players for the WIN_RATIO metric.",
+    "sql": "SELECT a.\"world_rank\", p.\"id\" AS player_id, p.\"username\", gm.\"name\" AS game_mode, gs.\"name\" AS game_scope, a.\"win_ratio\", a.\"world_percentile\" FROM \"public\".\"achievements\" a JOIN \"public\".\"metrics\" m ON a.\"metric_id\" = m.\"id\" JOIN \"public\".\"player\" p ON a.\"player_id\" = p.\"id\" LEFT JOIN \"public\".\"game_mode\" gm ON a.\"game_mode_id\" = gm.\"id\" LEFT JOIN \"public\".\"game_scope\" gs ON a.\"game_scope_id\" = gs.\"id\" WHERE m.\"name\" = 'WIN_RATIO' AND a.\"world_rank\" IS NOT NULL ORDER BY a.\"world_rank\" ASC LIMIT 20;"
+  },
+  {
+    "question": "What is the average world percentile by metric?",
+    "sql": "SELECT m.\"name\" AS metric_name, AVG(a.\"world_percentile\") AS avg_world_percentile FROM \"public\".\"achievements\" a JOIN \"public\".\"metrics\" m ON a.\"metric_id\" = m.\"id\" WHERE a.\"world_percentile\" IS NOT NULL GROUP BY m.\"name\" ORDER BY avg_world_percentile DESC NULLS LAST;"
+  },
+  {
+    "question": "Show the current leaderboard metadata.",
+    "sql": "SELECT * FROM \"public\".\"leaderboard_metadata\";"
+  },
+  {
+    "question": "How many ticket_activity rows are in each status during the last 30 days?",
+    "sql": "SELECT \"status\", COUNT(*) AS activity_count FROM \"public\".\"ticket_activity\" WHERE \"created_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY \"status\" ORDER BY activity_count DESC;"
+  },
+  {
+    "question": "What is the median total wait time by ticket status in the last 30 days?",
+    "sql": "SELECT \"status\", PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY \"total_wait_time\") AS median_total_wait_time FROM \"public\".\"ticket_activity\" WHERE \"created_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY \"status\" ORDER BY median_total_wait_time DESC NULLS LAST;"
+  },
+  {
+    "question": "What are the average disconnection and reconnection counts by ticket status?",
+    "sql": "SELECT \"status\", AVG(\"disconnection_count\") AS avg_disconnections, AVG(\"reconnection_count\") AS avg_reconnections FROM \"public\".\"ticket_activity\" GROUP BY \"status\" ORDER BY avg_disconnections DESC NULLS LAST;"
+  },
+  {
+    "question": "Which 20 players have the most NOTFOUND matchmaking results?",
+    "sql": "SELECT p.\"id\" AS player_id, p.\"username\", COUNT(*) AS notfound_count FROM \"public\".\"ticket_activity\" ta LEFT JOIN \"public\".\"player\" p ON ta.\"uid\" = p.\"id\"::text WHERE ta.\"status\" = 'NOTFOUND' GROUP BY p.\"id\", p.\"username\" ORDER BY notfound_count DESC LIMIT 20;"
+  },
+  {
+    "question": "Which 20 players have the most matchmaking issues in view_each_players_issue_count?",
+    "sql": "SELECT p.\"id\" AS player_id, p.\"username\", v.\"issue_count\" FROM \"public\".\"view_each_players_issue_count\" v LEFT JOIN \"public\".\"player\" p ON v.\"uid\" = p.\"id\"::text ORDER BY v.\"issue_count\" DESC NULLS LAST LIMIT 20;"
+  },
+  {
+    "question": "How many current matchmaking tickets exist by game mode?",
+    "sql": "SELECT gm.\"name\" AS game_mode, COUNT(*) AS open_ticket_count FROM \"public\".\"tickets\" t LEFT JOIN \"public\".\"game_mode\" gm ON t.\"game_mode_id\" = gm.\"id\" WHERE COALESCE(t.\"is_game_completed\", FALSE) = FALSE GROUP BY gm.\"name\" ORDER BY open_ticket_count DESC;"
+  },
+  {
+    "question": "How many current guest matchmaking tickets exist by game mode?",
+    "sql": "SELECT gm.\"name\" AS game_mode, COUNT(*) AS open_guest_ticket_count FROM \"public\".\"ticket_guest\" tg LEFT JOIN \"public\".\"game_mode\" gm ON tg.\"game_mode_id\" = gm.\"id\" WHERE COALESCE(tg.\"is_game_completed\", FALSE) = FALSE GROUP BY gm.\"name\" ORDER BY open_guest_ticket_count DESC;"
+  },
+  {
+    "question": "Who are the top 20 players by current gems in player_vault?",
+    "sql": "SELECT pv.\"player_id\", p.\"username\", pv.\"gems\", pv.\"unclaimed_gems\", pv.\"unprocessed_playsuper_gems\" FROM \"public\".\"player_vault\" pv LEFT JOIN \"public\".\"player\" p ON pv.\"player_id\" = p.\"id\" ORDER BY pv.\"gems\" DESC NULLS LAST LIMIT 20;"
+  },
+  {
+    "question": "Who are the top 20 players by coin balance in wallet?",
+    "sql": "SELECT w.\"player_id\", p.\"username\", w.\"coin\", w.\"gem\" FROM \"public\".\"wallet\" w LEFT JOIN \"public\".\"player\" p ON w.\"player_id\" = p.\"id\" ORDER BY w.\"coin\" DESC NULLS LAST LIMIT 20;"
+  },
+  {
+    "question": "Show gem transaction totals by source.",
+    "sql": "SELECT COALESCE(\"source\", 'UNKNOWN') AS transaction_source, COUNT(*) AS transaction_count, SUM(\"amount\") AS total_amount, AVG(\"amount\") AS avg_amount FROM \"public\".\"gem_transaction\" GROUP BY 1 ORDER BY total_amount DESC NULLS LAST;"
+  },
+  {
+    "question": "Show daily reward claims by day for the last 30 days.",
+    "sql": "SELECT DATE_TRUNC('day', \"claimed_at\") AS claim_day, COUNT(*) AS reward_claims FROM \"public\".\"daily_rewards_transaction\" WHERE \"claimed_at\" >= CURRENT_DATE - INTERVAL '30 days' GROUP BY 1 ORDER BY 1;"
+  },
+  {
+    "question": "Show reward claims by reward type and reward version.",
+    "sql": "SELECT r.\"reward_type\", r.\"reward_version\", COUNT(*) AS claim_count, SUM(COALESCE(r.\"coin_value\", 0)) AS total_coin_value, SUM(COALESCE(r.\"gem_value\", 0)) AS total_gem_value FROM \"public\".\"daily_rewards_transaction\" drt JOIN \"public\".\"rewards\" r ON drt.\"reward_id\" = r.\"id\" GROUP BY r.\"reward_type\", r.\"reward_version\" ORDER BY claim_count DESC;"
+  },
+  {
+    "question": "Which offers are active right now?",
+    "sql": "SELECT \"id\", \"offer_type\", \"claim_method_id\", \"featured\", \"starts_at\", \"ends_at\" FROM \"public\".\"offer\" WHERE \"starts_at\" <= CURRENT_TIMESTAMP AND (\"ends_at\" IS NULL OR \"ends_at\" >= CURRENT_TIMESTAMP) ORDER BY \"starts_at\" DESC;"
+  },
+  {
+    "question": "Show listed store items with their asset names and offer ids.",
+    "sql": "SELECT si.\"id\" AS store_item_id, a.\"name\" AS asset_name, a.\"product_id\", si.\"offer_id\", si.\"shown_from\", si.\"shown_to\" FROM \"public\".\"store_item\" si LEFT JOIN \"public\".\"asset\" a ON si.\"asset_id\" = a.\"id\" WHERE si.\"listed\" = TRUE ORDER BY si.\"shown_from\" DESC NULLS LAST LIMIT 50;"
+  },
+  {
+    "question": "Show active gem packs.",
+    "sql": "SELECT \"product_id\", \"base_gems\", \"bonus_percentage\", \"default_price_sgd\", \"tag_id\", \"offer_id\" FROM \"public\".\"gem_packs\" WHERE \"is_active\" = TRUE ORDER BY \"default_price_sgd\" ASC NULLS LAST;"
+  },
+  {
+    "question": "How many active IAP products exist for each platform?",
+    "sql": "SELECT up.\"platform\", COUNT(*) AS active_product_count FROM \"public\".\"iap_products\" ip CROSS JOIN LATERAL unnest(ip.\"platform\") AS up(\"platform\") WHERE ip.\"is_active\" = TRUE GROUP BY up.\"platform\" ORDER BY active_product_count DESC;"
+  },
+  {
+    "question": "Which campaigns are live today, grouped by target audience?",
+    "sql": "SELECT \"target_audience\", COUNT(*) AS live_campaign_count FROM \"public\".\"campaigns\" WHERE \"start_date\" <= CURRENT_TIMESTAMP AND (\"end_date\" IS NULL OR \"end_date\" >= CURRENT_TIMESTAMP) GROUP BY \"target_audience\" ORDER BY live_campaign_count DESC;"
+  },
+  {
+    "question": "How many assets are attached to each campaign?",
+    "sql": "SELECT c.\"id\" AS campaign_id, c.\"campaign_id\" AS external_campaign_id, c.\"name\", COUNT(ca.\"product_id\") AS asset_count FROM \"public\".\"campaigns\" c LEFT JOIN \"public\".\"campaign_assets\" ca ON c.\"id\" = ca.\"campaign_id\" GROUP BY c.\"id\", c.\"campaign_id\", c.\"name\" ORDER BY asset_count DESC, c.\"id\";"
+  },
+  {
+    "question": "How many App Store purchases are in each status?",
+    "sql": "SELECT \"status\", COUNT(*) AS purchase_count FROM \"public\".\"app_store_purchases\" GROUP BY \"status\" ORDER BY purchase_count DESC;"
+  },
+  {
+    "question": "How many App Store purchases came from each purchase source?",
+    "sql": "SELECT \"purchase_source\", COUNT(*) AS purchase_count FROM \"public\".\"app_store_purchases\" GROUP BY \"purchase_source\" ORDER BY purchase_count DESC;"
+  },
+  {
+    "question": "What are the top 20 product ids in app_store_purchases?",
+    "sql": "SELECT \"product_id\", COUNT(*) AS purchase_count FROM \"public\".\"app_store_purchases\" GROUP BY \"product_id\" ORDER BY purchase_count DESC NULLS LAST LIMIT 20;"
+  },
+  {
+    "question": "How many parsed product purchases are in each region code?",
+    "sql": "SELECT COALESCE(\"region_code\", 'UNKNOWN') AS region_code, COUNT(*) AS purchase_count FROM \"public\".\"product_purchases\" GROUP BY 1 ORDER BY purchase_count DESC;"
+  },
+  {
+    "question": "How many parsed product purchases are in each purchase state?",
+    "sql": "SELECT COALESCE(\"purchase_state\", 'UNKNOWN') AS purchase_state, COUNT(*) AS purchase_count FROM \"public\".\"product_purchases\" GROUP BY 1 ORDER BY purchase_count DESC;"
+  },
+  {
+    "question": "How many yesterday IAP rows are in each provider?",
+    "sql": "SELECT COALESCE(\"provider\", 'UNKNOWN') AS provider, COUNT(*) AS purchase_count FROM \"public\".\"view_yesterday_iap\" GROUP BY 1 ORDER BY purchase_count DESC;"
+  },
+  {
+    "question": "How many purchase transfers happened for each product id?",
+    "sql": "SELECT \"product_id\", COUNT(*) AS transfer_count FROM \"public\".\"purchase_transfer\" GROUP BY \"product_id\" ORDER BY transfer_count DESC NULLS LAST;"
+  },
+  {
+    "question": "Show PlaySuper transaction counts and net delta by event type.",
+    "sql": "SELECT COALESCE(\"event_type\", 'UNKNOWN') AS event_type, COUNT(*) AS transaction_count, SUM(\"delta\") AS net_delta FROM \"public\".\"playsuper_transaction\" GROUP BY 1 ORDER BY transaction_count DESC;"
+  },
+  {
+    "question": "Show net PlaySuper delta by coin id.",
+    "sql": "SELECT COALESCE(\"coin_id\", 'UNKNOWN') AS coin_id, COUNT(*) AS transaction_count, SUM(\"delta\") AS net_delta FROM \"public\".\"playsuper_all_transaction\" GROUP BY 1 ORDER BY net_delta DESC NULLS LAST;"
+  },
+  {
+    "question": "Which PlaySuper brands are listed by category and priority?",
+    "sql": "SELECT \"category\", \"name\", \"priority\" FROM \"public\".\"playsuper_brands\" WHERE \"listed\" = TRUE ORDER BY \"category\", \"priority\" ASC NULLS LAST, \"name\";"
+  },
+  {
+    "question": "Show the app rating distribution.",
+    "sql": "SELECT \"star_count\", COUNT(*) AS rating_count FROM \"public\".\"app_rating\" GROUP BY \"star_count\" ORDER BY \"star_count\";"
+  },
+  {
+    "question": "What is the average app rating by login provider?",
+    "sql": "SELECT lp.\"name\" AS provider, AVG(ar.\"star_count\") AS avg_star_rating, COUNT(*) AS rating_count FROM \"public\".\"app_rating\" ar LEFT JOIN \"public\".\"login_provider\" lp ON ar.\"provider_id\" = lp.\"id\" GROUP BY lp.\"name\" ORDER BY avg_star_rating DESC NULLS LAST;"
+  },
+  {
+    "question": "How many bug reports came from each OS in the last 90 days?",
+    "sql": "SELECT \"os\", COUNT(*) AS bug_report_count FROM \"public\".\"bug_report\" WHERE \"created_at\" >= CURRENT_DATE - INTERVAL '90 days' GROUP BY \"os\" ORDER BY bug_report_count DESC;"
+  },
+  {
+    "question": "Show monthly ad-related bug reports using view_ads.",
+    "sql": "SELECT DATE_TRUNC('month', \"created_at\") AS report_month, COUNT(*) AS ad_bug_report_count FROM \"public\".\"view_ads\" GROUP BY 1 ORDER BY 1;"
+  },
+  {
+    "question": "How many support messages are in each issue type and purchase status?",
+    "sql": "SELECT COALESCE(\"issue_type\", 'UNKNOWN') AS issue_type, COALESCE(\"purchase_status\", 'UNKNOWN') AS purchase_status, COUNT(*) AS message_count FROM \"public\".\"support_message\" GROUP BY 1, 2 ORDER BY message_count DESC;"
+  },
+  {
+    "question": "Which API endpoints are slowest by average response_time?",
+    "sql": "SELECT \"api_name\", AVG(\"response_time\") AS avg_response_time, AVG(\"total_time\") AS avg_total_time, COUNT(*) AS sample_count FROM \"public\".\"api_profile\" GROUP BY \"api_name\" ORDER BY avg_response_time DESC NULLS LAST;"
+  },
+  {
+    "question": "Show API profile rows by api_name and api_status.",
+    "sql": "SELECT \"api_name\", \"api_status\", COUNT(*) AS row_count FROM \"public\".\"api_profile\" GROUP BY \"api_name\", \"api_status\" ORDER BY row_count DESC;"
+  },
+  {
+    "question": "Which surveys are active today?",
+    "sql": "SELECT \"survey_uid\", \"survey_name\", \"start_date\", \"end_date\" FROM \"public\".\"surveys\" WHERE \"start_date\" <= CURRENT_TIMESTAMP AND (\"end_date\" IS NULL OR \"end_date\" >= CURRENT_TIMESTAMP) ORDER BY \"start_date\";"
+  },
+  {
+    "question": "How many survey responses came from each survey?",
+    "sql": "SELECT s.\"survey_name\", COUNT(*) AS response_count FROM \"public\".\"survey_responses\" sr LEFT JOIN \"public\".\"surveys\" s ON sr.\"survey_uid\" = s.\"survey_uid\" GROUP BY s.\"survey_name\" ORDER BY response_count DESC;"
+  },
+  {
+    "question": "How many survey responses came from each entry point?",
+    "sql": "SELECT COALESCE(\"entry_point\", 'UNKNOWN') AS entry_point, COUNT(*) AS response_count FROM \"public\".\"survey_responses\" GROUP BY 1 ORDER BY response_count DESC;"
+  },
+  {
+    "question": "Which events are active today?",
+    "sql": "SELECT \"name\", \"start_date\", \"end_date\" FROM \"public\".\"events\" WHERE \"start_date\" <= CURRENT_DATE AND (\"end_date\" IS NULL OR \"end_date\" >= CURRENT_DATE) ORDER BY \"start_date\";"
+  },
+  {
+    "question": "Show event login claims by event name and day.",
+    "sql": "SELECT \"event_name\", \"day\", COUNT(*) AS claim_count FROM \"public\".\"events_login\" WHERE \"claimed_at\" IS NOT NULL GROUP BY \"event_name\", \"day\" ORDER BY \"event_name\", \"day\";"
+  },
+  {
+    "question": "Show user event claim summary by event_name.",
+    "sql": "SELECT \"event_name\", COUNT(*) AS user_event_rows, SUM(CASE WHEN \"wallpaper_claimed_at\" IS NOT NULL THEN 1 ELSE 0 END) AS wallpaper_claims, SUM(CASE WHEN \"card_claimed_at\" IS NOT NULL THEN 1 ELSE 0 END) AS card_claims FROM \"public\".\"user_events\" GROUP BY \"event_name\" ORDER BY user_event_rows DESC;"
+  },
+  {
+    "question": "Which themes are active today?",
+    "sql": "SELECT \"theme_identifier\", \"start_date\", \"end_date\" FROM \"public\".\"themes\" WHERE \"start_date\" <= CURRENT_TIMESTAMP AND (\"end_date\" IS NULL OR \"end_date\" >= CURRENT_TIMESTAMP) ORDER BY \"start_date\";"
+  },
+  {
+    "question": "Which holidays are coming up in the next 30 days by country?",
+    "sql": "SELECT h.\"date\", c.\"name\" AS country, h.\"name\", h.\"title\" FROM \"public\".\"holiday\" h LEFT JOIN \"public\".\"country\" c ON h.\"country_id\" = c.\"id\" WHERE h.\"date\" >= CURRENT_DATE AND h.\"date\" < CURRENT_DATE + INTERVAL '30 days' ORDER BY h.\"date\", c.\"name\";"
+  },
+  {
+    "question": "Show notifications by notification_type and app version.",
+    "sql": "SELECT n.\"notification_type\", v.\"os\", v.\"version\", COUNT(*) AS notification_count FROM \"public\".\"notification\" n LEFT JOIN \"public\".\"version\" v ON n.\"version_id\" = v.\"id\" GROUP BY n.\"notification_type\", v.\"os\", v.\"version\" ORDER BY notification_count DESC;"
+  },
+  {
+    "question": "Show app installs by platform and version code.",
+    "sql": "SELECT \"platform\", \"version_code\", COUNT(*) AS install_count FROM \"public\".\"app_install\" GROUP BY \"platform\", \"version_code\" ORDER BY install_count DESC;"
+  },
+  {
+    "question": "Show anniversary login claims by day.",
+    "sql": "SELECT \"day\", COUNT(*) AS claim_count FROM \"public\".\"aniversary_login\" WHERE \"claimed_at\" IS NOT NULL GROUP BY \"day\" ORDER BY \"day\";"
+  },
+  {
+    "question": "How many voided purchases exist?",
+    "sql": "SELECT COUNT(*) AS voided_purchase_count FROM \"public\".\"voided_purchases\";"
   }
 ]

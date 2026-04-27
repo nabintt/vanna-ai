@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
-from vanna.types import TrainingPlan, TrainingPlanItem
+from vanna.legacy.types import TrainingPlan, TrainingPlanItem
 
 from app.config import Settings
 from app.db import DatabaseClient, build_bootstrap_examples, build_ddl_statements, list_tables_from_columns
