@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 import traceback
+from json import JSONDecodeError, JSONDecoder
 from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
 from vanna import Agent, AgentConfig
+from vanna.core.llm import LlmRequest, LlmResponse, LlmStreamChunk
+from vanna.core.tool import ToolCall, ToolSchema
 from vanna.core.user import RequestContext, User
 from vanna.core.user.resolver import UserResolver
 from vanna.integrations.ollama import OllamaLlmService
@@ -14,6 +18,141 @@ from vanna.legacy.adapter import LegacyVannaAdapter
 from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse
 
 from app.config import Settings
+
+JSON_CODE_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+
+
+class OllamaToolCallFallbackService(OllamaLlmService):
+    """Parse tool-call JSON from model text when native tool calling is unavailable."""
+
+    async def send_request(self, request: LlmRequest) -> LlmResponse:
+        response = await super().send_request(request)
+        return coerce_text_tool_calls(response, request.tools)
+
+    async def stream_request(
+        self,
+        request: LlmRequest,
+    ) -> AsyncGenerator[LlmStreamChunk, None]:
+        content_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        finish_reason: str | None = None
+        metadata: dict[str, Any] = {}
+
+        async for chunk in super().stream_request(request):
+            if chunk.content:
+                content_parts.append(chunk.content)
+            if chunk.tool_calls:
+                tool_calls.extend(chunk.tool_calls)
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
+            if chunk.metadata:
+                metadata.update(chunk.metadata)
+
+        response = LlmResponse(
+            content="".join(content_parts) or None,
+            tool_calls=tool_calls or None,
+            finish_reason=finish_reason,
+            metadata=metadata,
+        )
+        normalized = coerce_text_tool_calls(response, request.tools)
+        yield LlmStreamChunk(
+            content=normalized.content,
+            tool_calls=normalized.tool_calls,
+            finish_reason=normalized.finish_reason,
+            metadata=normalized.metadata,
+        )
+
+
+def coerce_text_tool_calls(
+    response: LlmResponse,
+    tools: list[ToolSchema] | None,
+) -> LlmResponse:
+    if response.tool_calls or not response.content or not tools:
+        return response
+
+    parsed_tool_calls = extract_text_tool_calls(response.content, tools)
+    if not parsed_tool_calls:
+        return response
+
+    metadata = dict(response.metadata)
+    metadata["tool_call_fallback"] = "text_json"
+    metadata["tool_call_fallback_count"] = len(parsed_tool_calls)
+
+    return LlmResponse(
+        content=None,
+        tool_calls=parsed_tool_calls,
+        finish_reason=response.finish_reason or "tool_calls",
+        usage=response.usage,
+        metadata=metadata,
+    )
+
+
+def extract_text_tool_calls(
+    content: str,
+    tools: list[ToolSchema] | None,
+) -> list[ToolCall]:
+    allowed_tool_names = {tool.name for tool in tools or []}
+    if not allowed_tool_names:
+        return []
+
+    candidates = [
+        match.group(1).strip()
+        for match in JSON_CODE_BLOCK_PATTERN.finditer(content)
+        if match.group(1).strip()
+    ]
+    if not candidates:
+        candidates = [content]
+
+    tool_calls: list[ToolCall] = []
+    for candidate in candidates:
+        for payload in decode_json_objects(candidate):
+            name = payload.get("name")
+            arguments = payload.get("arguments", {})
+            if name not in allowed_tool_names:
+                continue
+
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except JSONDecodeError:
+                    arguments = {"_raw": arguments}
+            if not isinstance(arguments, dict):
+                continue
+
+            tool_calls.append(
+                ToolCall(
+                    id=f"text-tool-call-{len(tool_calls) + 1}",
+                    name=name,
+                    arguments=arguments,
+                )
+            )
+
+    return tool_calls
+
+
+def decode_json_objects(candidate: str) -> list[dict[str, Any]]:
+    decoder = JSONDecoder()
+    index = 0
+    payloads: list[dict[str, Any]] = []
+
+    while index < len(candidate):
+        object_start = candidate.find("{", index)
+        if object_start == -1:
+            break
+
+        try:
+            decoded, next_index = decoder.raw_decode(candidate, object_start)
+        except JSONDecodeError:
+            index = object_start + 1
+            continue
+
+        if isinstance(decoded, dict):
+            payloads.append(decoded)
+        elif isinstance(decoded, list):
+            payloads.extend(item for item in decoded if isinstance(item, dict))
+        index = next_index
+
+    return payloads
 
 
 class LocalAdminUserResolver(UserResolver):
@@ -37,7 +176,7 @@ class LocalAdminUserResolver(UserResolver):
 
 def build_vanna_v2_chat_handler(vn: Any, settings: Settings) -> ChatHandler:
     legacy_adapter = LegacyVannaAdapter(vn)
-    llm_service = OllamaLlmService(
+    llm_service = OllamaToolCallFallbackService(
         model=settings.normalized_ollama_model,
         host=settings.ollama_host,
         timeout=settings.ollama_timeout,
