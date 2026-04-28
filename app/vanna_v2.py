@@ -119,15 +119,15 @@ def extract_text_tool_calls(
     if not allowed_tool_names:
         return []
 
-    candidates = [
+    candidates = [content]
+    candidates.extend(
         match.group(1).strip()
         for match in JSON_CODE_BLOCK_PATTERN.finditer(content)
         if match.group(1).strip()
-    ]
-    if not candidates:
-        candidates = [content]
+    )
 
     tool_calls: list[ToolCall] = []
+    seen_fingerprints: set[str] = set()
     for candidate in candidates:
         for payload in decode_json_objects(candidate):
             name = payload.get("name")
@@ -142,6 +142,15 @@ def extract_text_tool_calls(
                     arguments = {"_raw": arguments}
             if not isinstance(arguments, dict):
                 continue
+
+            fingerprint = json.dumps(
+                {"name": name, "arguments": arguments},
+                sort_keys=True,
+                default=str,
+            )
+            if fingerprint in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fingerprint)
 
             tool_calls.append(
                 ToolCall(

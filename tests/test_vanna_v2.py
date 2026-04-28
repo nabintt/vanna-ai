@@ -121,6 +121,30 @@ def test_coerce_text_tool_calls_leaves_normal_text_alone():
     assert normalized.tool_calls is None
 
 
+def test_extract_text_tool_calls_from_sql_explanation_plus_trailing_json():
+    content = """
+To get the top 10 players from the `leaderboard_past` table based on their skill, we need to join this table with the `top_skilled_player_games` table using the `player_id` column.
+
+```sql
+SELECT t2.username, t1.skill
+FROM leaderboard_past AS t1
+JOIN top_skilled_player_games AS t2 ON t1.player_id = t2.player_id
+ORDER BY t1.skill DESC
+LIMIT 10;
+```
+
+Let's execute this query.
+
+{"name": "run_sql", "arguments": {"sql":"SELECT t2.username, t1.skill FROM leaderboard_past AS t1 JOIN top_skilled_player_games AS t2 ON t1.player_id = t2.player_id ORDER BY t1.skill DESC LIMIT 10;"}}
+"""
+
+    tool_calls = extract_text_tool_calls(content, build_tool_schemas())
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "run_sql"
+    assert "ORDER BY t1.skill DESC" in tool_calls[0].arguments["sql"]
+
+
 class FakeSchemaAwareVanna:
     def get_training_data(self):
         return pd.DataFrame(
