@@ -168,6 +168,7 @@ def bootstrap_training(
     settings: Settings,
     extra_documentation: list[str] | None = None,
     extra_question_sql_pairs: list[dict[str, str]] | None = None,
+    include_training_data_files: bool = True,
 ) -> dict[str, Any]:
     logger.info("Starting bootstrap training for %s", settings.database_target)
     settings.ensure_directories()
@@ -198,7 +199,9 @@ def bootstrap_training(
         existing.ddl.add(fingerprint)
         ddl_added += 1
 
-    glossary_documents = _load_glossary_documents(settings.business_glossary_path)
+    glossary_documents: list[str] = []
+    if include_training_data_files:
+        glossary_documents = _load_glossary_documents(settings.business_glossary_path)
     if extra_documentation:
         glossary_documents.extend(extra_documentation)
 
@@ -211,8 +214,10 @@ def bootstrap_training(
         existing.documentation.add(fingerprint)
         documentation_added += 1
 
-    example_pairs = _load_example_pairs(settings.example_pairs_path)
-    if not example_pairs and settings.allow_bootstrap_sample_data:
+    example_pairs: list[dict[str, str]] = []
+    if include_training_data_files:
+        example_pairs = _load_example_pairs(settings.example_pairs_path)
+    if include_training_data_files and not example_pairs and settings.allow_bootstrap_sample_data:
         example_pairs = build_bootstrap_examples(settings.normalized_db_type, columns_df)
         _persist_example_pairs(settings.example_pairs_path, example_pairs)
 
@@ -267,6 +272,9 @@ def bootstrap_training(
             "glossary_path": str(settings.business_glossary_path),
             "example_pairs_path": str(settings.example_pairs_path),
         },
+        "bootstrap_inputs": {
+            "include_training_data_files": include_training_data_files,
+        },
         "generated_at": datetime.now(UTC).isoformat(),
     }
 
@@ -291,8 +299,17 @@ def ensure_training_ready(vn: Any, db: DatabaseClient, settings: Settings) -> di
         }
 
     if settings.train_on_start:
-        logger.info("No training data found. TRAIN_ON_START=true, running bootstrap.")
-        return bootstrap_training(vn=vn, db=db, settings=settings)
+        logger.info(
+            "No training data found. TRAIN_ON_START=true, running bootstrap "
+            "(include_training_data_files=%s).",
+            settings.include_training_files_on_start,
+        )
+        return bootstrap_training(
+            vn=vn,
+            db=db,
+            settings=settings,
+            include_training_data_files=settings.include_training_files_on_start,
+        )
 
     raise TrainingBootstrapError(
         "No Vanna training data was found in the local Chroma store. "

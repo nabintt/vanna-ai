@@ -27,6 +27,7 @@ def test_vanna_ui_settings_load_from_environment(monkeypatch):
     monkeypatch.setenv("VANNA_UI_TITLE", "My Vanna")
     monkeypatch.setenv("VANNA_UI_SUBTITLE", "My Subtitle")
     monkeypatch.setenv("VANNA_UI_CDN_URL", "https://cdn.example.com/vanna.js")
+    monkeypatch.setenv("INCLUDE_TRAINING_FILES_ON_START", "true")
 
     get_settings.cache_clear()
     settings = get_settings()
@@ -34,6 +35,7 @@ def test_vanna_ui_settings_load_from_environment(monkeypatch):
     assert settings.vanna_ui_title == "My Vanna"
     assert settings.vanna_ui_subtitle == "My Subtitle"
     assert settings.vanna_ui_cdn_url == "https://cdn.example.com/vanna.js"
+    assert settings.include_training_files_on_start is True
 
     get_settings.cache_clear()
 

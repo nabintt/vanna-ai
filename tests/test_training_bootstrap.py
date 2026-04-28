@@ -124,7 +124,11 @@ class FakeDatabase:
         )
 
 
-def build_settings(tmp_path, train_on_start: bool) -> Settings:
+def build_settings(
+    tmp_path,
+    train_on_start: bool,
+    include_training_files_on_start: bool = False,
+) -> Settings:
     training_dir = tmp_path / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
     glossary_path = training_dir / "business_glossary.md"
@@ -138,6 +142,7 @@ def build_settings(tmp_path, train_on_start: bool) -> Settings:
         db_user="analyst",
         db_password="secret",
         train_on_start=train_on_start,
+        include_training_files_on_start=include_training_files_on_start,
         allow_bootstrap_sample_data=True,
         chroma_path=tmp_path / "chroma",
         training_data_dir=training_dir,
@@ -181,3 +186,21 @@ def test_ensure_training_ready_raises_when_empty_and_train_on_start_is_disabled(
 
     with pytest.raises(TrainingBootstrapError):
         ensure_training_ready(vn=vn, db=db, settings=settings)
+
+
+def test_ensure_training_ready_skips_local_training_files_on_startup(tmp_path):
+    settings = build_settings(
+        tmp_path,
+        train_on_start=True,
+        include_training_files_on_start=False,
+    )
+    vn = FakeVanna()
+    db = FakeDatabase()
+
+    summary = ensure_training_ready(vn=vn, db=db, settings=settings)
+
+    assert summary["bootstrap_inputs"]["include_training_data_files"] is False
+    assert len(vn.ddl) >= 1
+    assert len(vn.documentation) == 1
+    assert len(vn.question_sql) == 0
+    assert vn.documentation == ["The orders table stores one row per purchase."]

@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     db_password: str = Field(default="", validation_alias="DB_PASSWORD")
 
     train_on_start: bool = Field(default=True, validation_alias="TRAIN_ON_START")
+    include_training_files_on_start: bool = Field(
+        default=False,
+        validation_alias="INCLUDE_TRAINING_FILES_ON_START",
+    )
     allow_bootstrap_sample_data: bool = Field(
         default=True,
         validation_alias="ALLOW_BOOTSTRAP_SAMPLE_DATA",
