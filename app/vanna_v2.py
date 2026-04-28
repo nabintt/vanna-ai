@@ -36,6 +36,7 @@ DDL_COLUMN_PATTERN = re.compile(
 )
 DDL_SKIP_TOKENS = {"create", "table", "primary", "constraint", "foreign", "unique", "check"}
 REQUEST_SCHEMA_CONTEXT_MARKER = "[Attached schema context for this request]"
+REQUEST_SQL_FEEDBACK_MARKER = "[Recent SQL execution feedback for this conversation]"
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,14 @@ class SchemaCatalogEntry:
     columns: tuple[str, ...]
     ddl: str
     search_terms: frozenset[str]
+
+
+@dataclass(frozen=True)
+class RecentSqlAttempt:
+    sql: str
+    tables: tuple[str, ...]
+    outcome: str
+    detail: str
 
 
 class OllamaToolCallFallbackService(OllamaLlmService):
@@ -217,6 +226,7 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             "- Do not invent columns such as `username`, `name`, or `skill` unless they are explicitly present in the provided schema.",
             "- If a SQL execution error mentions a missing table or column, treat it as a schema mismatch and correct the query before drawing conclusions.",
             "- Never conclude that a table is empty just because a previous SQL statement failed.",
+            "- Treat recent SQL errors and empty-result attempts as negative evidence. Do not repeat the same query path unchanged.",
             "- If the schema context is still insufficient, prefer a read-only metadata query against `information_schema` or relevant catalog views before guessing.",
         ]
 
@@ -260,7 +270,10 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             schema_catalog=self.schema_catalog,
             question=base_content,
         )
-        request_context = format_request_schema_context(context_bundle)
+        request_context = format_request_schema_context(
+            context_bundle,
+            collect_recent_run_sql_attempts(messages),
+        )
         if not request_context:
             return messages
 
@@ -453,6 +466,10 @@ def truncate_text(value: str, limit: int) -> str:
     return value[: limit - 3].rstrip() + "..."
 
 
+def normalize_whitespace(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
 def format_schema_context(related_ddl: list[str]) -> str:
     if not related_ddl:
         return ""
@@ -487,10 +504,14 @@ def format_question_sql_examples(pairs: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def format_request_schema_context(context_bundle: dict[str, Any]) -> str:
+def format_request_schema_context(
+    context_bundle: dict[str, Any],
+    recent_sql_attempts: list[RecentSqlAttempt] | None = None,
+) -> str:
     related_ddl = context_bundle.get("related_ddl", [])
     related_docs = context_bundle.get("related_docs", [])
     similar_pairs = context_bundle.get("similar_pairs", [])
+    recent_sql_attempts = recent_sql_attempts or []
 
     parts = [REQUEST_SCHEMA_CONTEXT_MARKER]
 
@@ -512,10 +533,104 @@ def format_request_schema_context(context_bundle: dict[str, Any]) -> str:
     if examples_section:
         parts.extend(["## Similar SQL Examples", examples_section])
 
+    feedback_section = format_recent_sql_feedback(recent_sql_attempts)
+    if feedback_section:
+        parts.extend(["## Recent SQL Feedback", feedback_section])
+
     if len(parts) == 1:
         return ""
 
     return "\n".join(parts)
+
+
+def collect_recent_run_sql_attempts(messages: list[LlmMessage], limit: int = 4) -> list[RecentSqlAttempt]:
+    tool_calls_by_id: dict[str, str] = {}
+    attempts: list[RecentSqlAttempt] = []
+    seen: set[tuple[str, str]] = set()
+
+    for message in messages:
+        if message.role == "assistant" and message.tool_calls:
+            for tool_call in message.tool_calls:
+                if tool_call.name != "run_sql" or not tool_call.id:
+                    continue
+                sql = str(tool_call.arguments.get("sql", "")).strip()
+                if sql:
+                    tool_calls_by_id[tool_call.id] = sql
+
+    for message in messages:
+        if message.role != "tool" or not message.tool_call_id:
+            continue
+        sql = tool_calls_by_id.get(message.tool_call_id)
+        if not sql:
+            continue
+
+        outcome = classify_run_sql_outcome(message.content)
+        if outcome is None:
+            continue
+
+        detail = normalize_whitespace(message.content or "")
+        fingerprint = (normalize_whitespace(sql), outcome)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+
+        attempts.append(
+            RecentSqlAttempt(
+                sql=sql,
+                tables=tuple(extract_table_names_from_sql(sql)),
+                outcome=outcome,
+                detail=detail,
+            )
+        )
+
+    return attempts[-limit:]
+
+
+def classify_run_sql_outcome(content: str) -> str | None:
+    normalized = " ".join((content or "").strip().lower().split())
+    if not normalized:
+        return None
+    if "results saved to file:" in normalized or "rows affected" in normalized:
+        return None
+    if "no rows returned" in normalized or "0 rows" in normalized:
+        return "empty"
+    return "error"
+
+
+def extract_table_names_from_sql(sql: str) -> list[str]:
+    matches = re.findall(
+        r"\b(?:from|join)\s+((?:\"[^\"]+\"|`[^`]+`|[A-Za-z0-9_]+)(?:\.(?:\"[^\"]+\"|`[^`]+`|[A-Za-z0-9_]+))?)",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    table_names: list[str] = []
+    seen: set[str] = set()
+    for match in matches:
+        normalized = match.replace('"', "").replace("`", "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        table_names.append(normalized)
+    return table_names
+
+
+def format_recent_sql_feedback(attempts: list[RecentSqlAttempt]) -> str:
+    if not attempts:
+        return ""
+
+    lines = [REQUEST_SQL_FEEDBACK_MARKER]
+    for attempt in attempts:
+        tables_display = ", ".join(f"`{table}`" for table in attempt.tables) if attempt.tables else "unknown tables"
+        sql_preview = truncate_text(attempt.sql, 320)
+        if attempt.outcome == "empty":
+            lines.append(
+                f"- Empty result for SQL on {tables_display}: `{sql_preview}`. This only means that exact query returned no rows. Do not repeat the same join/filter unchanged, and do not assume those tables are empty."
+            )
+        else:
+            lines.append(
+                f"- Failed SQL on {tables_display}: `{sql_preview}`. Error: {truncate_text(attempt.detail, 220)}. Do not retry the same broken columns/tables unchanged."
+            )
+    return "\n".join(lines)
 
 
 class LocalAdminUserResolver(UserResolver):

@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import pandas as pd
 from vanna.core.llm import LlmMessage, LlmResponse
+from vanna.core.tool import ToolCall
 from vanna.core.tool import ToolSchema
 from vanna.core.user import User
 
 from app.vanna_v2 import (
     REQUEST_SCHEMA_CONTEXT_MARKER,
+    REQUEST_SQL_FEEDBACK_MARKER,
     SchemaAwareLlmContextEnhancer,
     build_schema_catalog,
     coerce_text_tool_calls,
@@ -250,3 +252,52 @@ def test_schema_aware_enhancer_appends_schema_to_user_message():
     assert REQUEST_SCHEMA_CONTEXT_MARKER in enhanced_messages[-1].content
     assert 'CREATE TABLE "public"."leaderboard_past"' in enhanced_messages[-1].content
     assert "Use the following real database schema while answering this request." in enhanced_messages[-1].content
+
+
+def test_schema_aware_enhancer_appends_recent_sql_feedback():
+    vn = FakeSchemaAwareVanna()
+    enhancer = SchemaAwareLlmContextEnhancer(vn, agent_memory=None)
+    user = User(
+        id="u1",
+        username="analyst",
+        email="analyst@example.com",
+        group_memberships=["user"],
+    )
+
+    messages = [
+        LlmMessage(role="user", content="show top players"),
+        LlmMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="tc1",
+                    name="run_sql",
+                    arguments={
+                        "sql": "SELECT t2.username, t1.skill FROM leaderboard_past AS t1 JOIN top_skilled_player_games AS t2 ON t1.player_id = t2.player_id ORDER BY t1.skill DESC LIMIT 10;"
+                    },
+                ),
+                ToolCall(
+                    id="tc2",
+                    name="run_sql",
+                    arguments={"sql": "SELECT * FROM leaderboard_past LIMIT 10;"},
+                ),
+            ],
+        ),
+        LlmMessage(role="tool", content='column "username" does not exist', tool_call_id="tc1"),
+        LlmMessage(
+            role="tool",
+            content="Query executed successfully. No rows returned.",
+            tool_call_id="tc2",
+        ),
+        LlmMessage(role="user", content="try a better query"),
+    ]
+
+    enhanced_messages = asyncio.run(enhancer.enhance_user_messages(messages, user))
+    final_content = enhanced_messages[-1].content or ""
+
+    assert REQUEST_SQL_FEEDBACK_MARKER in final_content
+    assert "Do not retry the same broken columns/tables unchanged." in final_content
+    assert "Do not repeat the same join/filter unchanged" in final_content
+    assert "`leaderboard_past`" in final_content
+    assert "`top_skilled_player_games`" in final_content
