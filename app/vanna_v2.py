@@ -48,6 +48,9 @@ logger = logging.getLogger(__name__)
 
 JSON_CODE_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 SQL_CODE_BLOCK_PATTERN = re.compile(r"```sql\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+ROWS_JSON_BLOCK_PATTERN = re.compile(r"Rows:\s*```json\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+ROW_COUNT_PATTERN = re.compile(r"Returned\s+(\d+)\s+row\(s\)", re.IGNORECASE)
+NO_ROWS_PATTERN = re.compile(r"no rows were returned|no rows returned", re.IGNORECASE)
 SEARCH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 DDL_TABLE_PATTERN = re.compile(
     r"CREATE\s+TABLE\s+(?:\"|`)?(?P<schema>[A-Za-z0-9_]+)(?:\"|`)?\.(?:\"|`)?(?P<table>[A-Za-z0-9_]+)(?:\"|`)?",
@@ -92,6 +95,14 @@ class RecentSqlAttempt:
     tables: tuple[str, ...]
     outcome: str
     detail: str
+
+
+@dataclass(frozen=True)
+class SuccessfulSqlResult:
+    sql: str
+    row_count: int
+    columns: tuple[str, ...]
+    rows: tuple[dict[str, Any], ...]
 
 
 class NoOpAgentMemory(AgentMemory):
@@ -188,6 +199,7 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
     def __init__(self, db: DatabaseClient, max_rows: int):
         self.db = db
         self.max_rows = max_rows
+        self._successful_sql_by_conversation: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -201,17 +213,31 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
         return RunSqlToolArgs
 
     async def execute(self, context: ToolContext, args: RunSqlToolArgs) -> ToolResult:
-        del context
         sql = args.sql.strip()
         if not is_read_only_sql(sql):
             return build_sql_tool_error(
                 "Only single-statement read-only SQL is allowed here. Use SELECT, WITH, SHOW, DESCRIBE, or EXPLAIN."
             )
 
+        sql_fingerprint = normalize_sql_for_comparison(sql)
+        previous_sql = self._successful_sql_by_conversation.get(context.conversation_id)
+        if previous_sql == sql_fingerprint:
+            return ToolResult(
+                success=True,
+                result_for_llm=(
+                    "This exact SQL already executed successfully in this conversation. "
+                    "Do not run it again. Use the existing result and answer the user now."
+                ),
+                ui_component=None,
+                metadata={"duplicate_sql": True, "sql": sql},
+            )
+
         try:
             result = await run_in_threadpool(self.db.execute_sql, sql, self.max_rows)
         except (DatabaseConnectionError, ValueError) as exc:
             return build_sql_tool_error(str(exc))
+
+        self._successful_sql_by_conversation[context.conversation_id] = sql_fingerprint
 
         description = (
             f"Returned {result.row_count} row(s)"
@@ -369,34 +395,33 @@ def coerce_text_tool_calls(
     tools: list[ToolSchema] | None,
     messages: list[LlmMessage] | None = None,
 ) -> LlmResponse:
-    if response.tool_calls or not response.content or not tools:
-        return response
+    normalized = response
+    if not normalized.tool_calls and normalized.content and tools:
+        parsed_tool_calls = extract_text_tool_calls(normalized.content, tools)
+        inferred_from_context = False
+        if not parsed_tool_calls:
+            parsed_tool_calls = infer_run_sql_tool_call_from_context(
+                normalized.content,
+                tools,
+                messages or [],
+            )
+            inferred_from_context = bool(parsed_tool_calls)
+        if parsed_tool_calls:
+            metadata = dict(normalized.metadata)
+            metadata["tool_call_fallback"] = "text_json"
+            metadata["tool_call_fallback_count"] = len(parsed_tool_calls)
+            if inferred_from_context:
+                metadata["tool_call_fallback"] = "context_sql_reuse"
 
-    parsed_tool_calls = extract_text_tool_calls(response.content, tools)
-    inferred_from_context = False
-    if not parsed_tool_calls:
-        parsed_tool_calls = infer_run_sql_tool_call_from_context(
-            response.content,
-            tools,
-            messages or [],
-        )
-        inferred_from_context = bool(parsed_tool_calls)
-    if not parsed_tool_calls:
-        return response
+            normalized = LlmResponse(
+                content=None,
+                tool_calls=parsed_tool_calls,
+                finish_reason=normalized.finish_reason or "tool_calls",
+                usage=normalized.usage,
+                metadata=metadata,
+            )
 
-    metadata = dict(response.metadata)
-    metadata["tool_call_fallback"] = "text_json"
-    metadata["tool_call_fallback_count"] = len(parsed_tool_calls)
-    if inferred_from_context:
-        metadata["tool_call_fallback"] = "context_sql_reuse"
-
-    return LlmResponse(
-        content=None,
-        tool_calls=parsed_tool_calls,
-        finish_reason=response.finish_reason or "tool_calls",
-        usage=response.usage,
-        metadata=metadata,
-    )
+    return suppress_duplicate_run_sql_tool_calls(normalized, messages or [])
 
 
 def extract_text_tool_calls(
@@ -480,6 +505,58 @@ def infer_run_sql_tool_call_from_context(
     ]
 
 
+def suppress_duplicate_run_sql_tool_calls(
+    response: LlmResponse,
+    messages: list[LlmMessage],
+) -> LlmResponse:
+    if not response.tool_calls:
+        return response
+
+    last_success = extract_last_successful_run_sql_result(messages)
+    if last_success is None:
+        return response
+
+    filtered_tool_calls: list[ToolCall] = []
+    suppressed_duplicate = False
+    for tool_call in response.tool_calls:
+        if tool_call.name != "run_sql":
+            filtered_tool_calls.append(tool_call)
+            continue
+
+        sql = str(tool_call.arguments.get("sql", "")).strip()
+        if normalize_sql_for_comparison(sql) == normalize_sql_for_comparison(last_success.sql):
+            suppressed_duplicate = True
+            continue
+
+        filtered_tool_calls.append(tool_call)
+
+    if filtered_tool_calls:
+        if not suppressed_duplicate:
+            return response
+        metadata = dict(response.metadata)
+        metadata["suppressed_duplicate_tool_call"] = True
+        return LlmResponse(
+            content=response.content,
+            tool_calls=filtered_tool_calls,
+            finish_reason=response.finish_reason,
+            usage=response.usage,
+            metadata=metadata,
+        )
+
+    if not suppressed_duplicate:
+        return response
+
+    metadata = dict(response.metadata)
+    metadata["suppressed_duplicate_tool_call"] = True
+    return LlmResponse(
+        content=build_duplicate_sql_answer(last_success),
+        tool_calls=None,
+        finish_reason="stop",
+        usage=response.usage,
+        metadata=metadata,
+    )
+
+
 def looks_like_followup_run_sql_request(last_user_message: str, response_content: str) -> bool:
     haystacks = [last_user_message, response_content]
     return any(FOLLOWUP_RUN_SQL_PATTERN.search(haystack or "") for haystack in haystacks)
@@ -494,6 +571,11 @@ def is_context_dependent_followup_request(message: str) -> bool:
     return bool(CONTEXT_DEPENDENT_FOLLOWUP_PATTERN.search(normalized))
 
 
+def normalize_sql_for_comparison(sql: str) -> str:
+    normalized = normalize_whitespace(sql).rstrip(";")
+    return normalized.lower()
+
+
 def extract_latest_assistant_sql(messages: list[LlmMessage]) -> str | None:
     for message in reversed(messages):
         if message.role != "assistant" or not message.content:
@@ -503,6 +585,98 @@ def extract_latest_assistant_sql(messages: list[LlmMessage]) -> str | None:
             if is_read_only_sql(sql):
                 return sql
     return None
+
+
+def extract_last_successful_run_sql_result(messages: list[LlmMessage]) -> SuccessfulSqlResult | None:
+    tool_calls_by_id: dict[str, str] = {}
+    for message in messages:
+        if message.role != "assistant" or not message.tool_calls:
+            continue
+        for tool_call in message.tool_calls:
+            if tool_call.name != "run_sql" or not tool_call.id:
+                continue
+            sql = str(tool_call.arguments.get("sql", "")).strip()
+            if sql:
+                tool_calls_by_id[tool_call.id] = sql
+
+    for message in reversed(messages):
+        if message.role != "tool" or not message.tool_call_id:
+            continue
+        sql = tool_calls_by_id.get(message.tool_call_id)
+        if not sql:
+            continue
+        if not is_successful_run_sql_content(message.content or ""):
+            continue
+
+        content = message.content or ""
+        return SuccessfulSqlResult(
+            sql=sql,
+            row_count=extract_row_count_from_tool_content(content),
+            columns=tuple(extract_columns_from_tool_content(content)),
+            rows=tuple(extract_rows_from_tool_content(content)),
+        )
+
+    return None
+
+
+def is_successful_run_sql_content(content: str) -> bool:
+    normalized = normalize_whitespace(content).lower()
+    return "sql executed successfully." in normalized or "query executed successfully." in normalized
+
+
+def extract_row_count_from_tool_content(content: str) -> int:
+    match = ROW_COUNT_PATTERN.search(content)
+    if match:
+        return int(match.group(1))
+    if NO_ROWS_PATTERN.search(content):
+        return 0
+    return 0
+
+
+def extract_columns_from_tool_content(content: str) -> list[str]:
+    for line in content.splitlines():
+        if not line.lower().startswith("columns:"):
+            continue
+        raw_columns = line.split(":", 1)[1]
+        return [column.strip() for column in raw_columns.split(",") if column.strip()]
+    return []
+
+
+def extract_rows_from_tool_content(content: str) -> list[dict[str, Any]]:
+    match = ROWS_JSON_BLOCK_PATTERN.search(content)
+    if not match:
+        return []
+
+    try:
+        payload = json.loads(match.group(1).strip())
+    except JSONDecodeError:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+    return [row for row in payload if isinstance(row, dict)]
+
+
+def build_duplicate_sql_answer(result: SuccessfulSqlResult) -> str:
+    if result.row_count == 0:
+        return "I already ran that exact SQL and it returned no rows, so I won't rerun it."
+
+    if result.rows:
+        first_row = result.rows[0]
+        row_summary = ", ".join(f"`{key}` = {value}" for key, value in first_row.items())
+        return (
+            "I already ran that exact SQL successfully, so I won't rerun it. "
+            f"The result is: {row_summary}."
+        )
+
+    if result.columns:
+        columns_summary = ", ".join(f"`{column}`" for column in result.columns)
+        return (
+            "I already ran that exact SQL successfully, so I won't rerun it. "
+            f"The result shown above contains {result.row_count} row(s) with columns {columns_summary}."
+        )
+
+    return "I already ran that exact SQL successfully, so I won't rerun it."
 
 
 def decode_json_objects(candidate: str) -> list[dict[str, Any]]:

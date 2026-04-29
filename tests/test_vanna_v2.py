@@ -5,17 +5,22 @@ import pandas as pd
 from vanna.core.llm import LlmMessage, LlmResponse
 from vanna.core.storage import Message
 from vanna.core.tool import ToolCall
+from vanna.core.tool import ToolContext
 from vanna.core.tool import ToolSchema
 from vanna.core.user import User
 
 from app.vanna_v2 import (
     REQUEST_SCHEMA_CONTEXT_MARKER,
     REQUEST_SQL_FEEDBACK_MARKER,
+    build_duplicate_sql_answer,
+    coerce_text_tool_calls,
+    extract_last_successful_run_sql_result,
     filter_question_sql_pairs_for_context,
     is_context_dependent_followup_request,
+    NoOpAgentMemory,
+    ReadOnlySqlTool,
     SchemaAwareLlmContextEnhancer,
     build_schema_catalog,
-    coerce_text_tool_calls,
     extract_text_tool_calls,
     is_read_only_sql,
     search_schema_catalog,
@@ -162,6 +167,48 @@ LIMIT 10;
     assert normalized.metadata["tool_call_fallback"] == "context_sql_reuse"
 
 
+def test_coerce_text_tool_calls_suppresses_duplicate_successful_run_sql():
+    response = LlmResponse(
+        content=None,
+        tool_calls=[
+            ToolCall(
+                id="tc-next",
+                name="run_sql",
+                arguments={"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'},
+            )
+        ],
+    )
+    messages = [
+        LlmMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="tc-prev",
+                    name="run_sql",
+                    arguments={"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'},
+                )
+            ],
+        ),
+        LlmMessage(
+            role="tool",
+            content=(
+                "SQL executed successfully. Use this result to answer the user's question.\n"
+                "Returned 1 row(s). Duration: 12.5 ms.\n"
+                "Columns: item_id, uses\n"
+                "Rows:\n```json\n[{\"item_id\": 2, \"uses\": 2647107}]\n```"
+            ),
+            tool_call_id="tc-prev",
+        ),
+    ]
+
+    normalized = coerce_text_tool_calls(response, build_tool_schemas(), messages)
+
+    assert normalized.tool_calls is None
+    assert "item_id" in (normalized.content or "")
+    assert normalized.metadata["suppressed_duplicate_tool_call"] is True
+
+
 def test_extract_text_tool_calls_from_sql_explanation_plus_trailing_json():
     content = """
 To get the top 10 players from the `leaderboard_past` table based on their skill, we need to join this table with the `top_skilled_player_games` table using the `player_id` column.
@@ -184,6 +231,40 @@ Let's execute this query.
     assert len(tool_calls) == 1
     assert tool_calls[0].name == "run_sql"
     assert "ORDER BY t1.skill DESC" in tool_calls[0].arguments["sql"]
+
+
+def test_extract_last_successful_run_sql_result_parses_rows():
+    messages = [
+        LlmMessage(
+            role="assistant",
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="tc1",
+                    name="run_sql",
+                    arguments={"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'},
+                )
+            ],
+        ),
+        LlmMessage(
+            role="tool",
+            content=(
+                "SQL executed successfully. Use this result to answer the user's question.\n"
+                "Returned 1 row(s). Duration: 12.5 ms.\n"
+                "Columns: item_id, uses\n"
+                "Rows:\n```json\n[{\"item_id\": 2, \"uses\": 2647107}]\n```"
+            ),
+            tool_call_id="tc1",
+        ),
+    ]
+
+    result = extract_last_successful_run_sql_result(messages)
+
+    assert result is not None
+    assert result.row_count == 1
+    assert result.columns == ("item_id", "uses")
+    assert result.rows[0]["item_id"] == 2
+    assert "2647107" in build_duplicate_sql_answer(result)
 
 
 class FakeSchemaAwareVanna:
@@ -431,3 +512,56 @@ def test_is_context_dependent_followup_request_detects_followup_language():
         )
         is False
     )
+
+
+def test_read_only_sql_tool_skips_duplicate_successful_query_execution():
+    class FakeDb:
+        def __init__(self):
+            self.calls: list[tuple[str, int]] = []
+
+        def execute_sql(self, sql: str, max_rows: int):
+            from app.db import SqlExecutionResult
+
+            self.calls.append((sql, max_rows))
+            return SqlExecutionResult(
+                sql=sql,
+                columns=["item_id", "uses"],
+                rows=[{"item_id": 2, "uses": 2647107}],
+                row_count=1,
+                returns_rows=True,
+                truncated=False,
+                duration_ms=10.0,
+            )
+
+    fake_db = FakeDb()
+    tool = ReadOnlySqlTool(db=fake_db, max_rows=10)
+    context = ToolContext(
+        user=User(
+            id="u1",
+            username="analyst",
+            email="analyst@example.com",
+            group_memberships=["user"],
+        ),
+        conversation_id="conv-1",
+        request_id="req-1",
+        agent_memory=NoOpAgentMemory(),
+    )
+
+    async def run_twice():
+        first = await tool.execute(
+            context,
+            type("Args", (), {"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'})(),
+        )
+        second = await tool.execute(
+            context,
+            type("Args", (), {"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'})(),
+        )
+        return first, second
+
+    first_result, second_result = asyncio.run(run_twice())
+
+    assert len(fake_db.calls) == 1
+    assert first_result.success is True
+    assert second_result.success is True
+    assert second_result.ui_component is None
+    assert second_result.metadata["duplicate_sql"] is True
