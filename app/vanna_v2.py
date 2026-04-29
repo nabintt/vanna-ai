@@ -209,6 +209,33 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
         self.max_rows = max_rows
         self._successful_sql_by_conversation: dict[str, str] = {}
 
+    def _cache_key(self, context: ToolContext) -> str:
+        """
+        Use the most stable identifier available from ToolContext.
+        Some Vanna executions can change/omit `conversation_id` across tool iterations,
+        which prevents duplicate suppression unless we fall back to other ids.
+        """
+        # Prefer conversation id if present.
+        for attr in (
+            "conversation_id",
+            # Common fallback identifiers (may or may not exist on ToolContext).
+            "request_id",
+            "session_id",
+            "user_id",
+        ):
+            value = getattr(context, attr, None)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                if value.strip():
+                    return value.strip()
+                continue
+            # For non-strings, still create a deterministic key.
+            return str(value)
+
+        # Last resort: suppress duplicates only when the tool context provides nothing stable.
+        return "unknown_context"
+
     @property
     def name(self) -> str:
         return "run_sql"
@@ -228,7 +255,8 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
             )
 
         sql_fingerprint = normalize_sql_for_comparison(sql)
-        previous_sql = self._successful_sql_by_conversation.get(context.conversation_id)
+        cache_key = self._cache_key(context)
+        previous_sql = self._successful_sql_by_conversation.get(cache_key)
         if previous_sql == sql_fingerprint:
             return ToolResult(
                 success=True,
@@ -245,7 +273,7 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
         except (DatabaseConnectionError, ValueError) as exc:
             return build_sql_tool_error(str(exc))
 
-        self._successful_sql_by_conversation[context.conversation_id] = sql_fingerprint
+        self._successful_sql_by_conversation[cache_key] = sql_fingerprint
 
         description = (
             f"Returned {result.row_count} row(s)"
