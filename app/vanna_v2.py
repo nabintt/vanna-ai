@@ -29,8 +29,10 @@ from vanna.components import (
 )
 from vanna import Agent, AgentConfig
 from vanna.core.enhancer import DefaultLlmContextEnhancer, LlmContextEnhancer
+from vanna.core.filter import ConversationFilter
 from vanna.core.llm import LlmMessage, LlmRequest, LlmResponse, LlmStreamChunk
 from vanna.core.registry import ToolRegistry
+from vanna.core.storage import Message
 from vanna.core.system_prompt import SystemPromptBuilder
 from vanna.core.tool import Tool, ToolCall, ToolContext, ToolResult, ToolSchema
 from vanna.core.user import RequestContext, User
@@ -65,6 +67,13 @@ REQUEST_SCHEMA_CONTEXT_MARKER = "[Attached schema context for this request]"
 REQUEST_SQL_FEEDBACK_MARKER = "[Recent SQL execution feedback for this conversation]"
 FOLLOWUP_RUN_SQL_PATTERN = re.compile(
     r"\b(run|execute|use|try)\b.*\b(query|sql|statement|above|previous|that|this|it)\b",
+    re.IGNORECASE,
+)
+CONTEXT_DEPENDENT_FOLLOWUP_PATTERN = re.compile(
+    r"\b("
+    r"above|previous|earlier|same|that|those|them|it|this query|this sql|that query|that sql|"
+    r"add|include|exclude|remove|filter|sort|order|group|limit|change|modify|instead|continue|again|reuse"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -162,6 +171,7 @@ class SqlChatSystemPromptBuilder(SystemPromptBuilder):
             [
                 "You are a careful SQL analyst assistant.",
                 "Use only the real schema context and the available SQL tool.",
+                "Treat each new standalone user question as a fresh request unless the user explicitly refers to a previous query, result, or instruction.",
                 "Call `run_sql` only when you still need information to answer the user.",
                 "When you make a tool call, the tool name must be exactly `run_sql` and the arguments must be `{\"sql\": \"...\"}`.",
                 "If the user asks to run the previous or above query, reuse the latest SQL you already produced instead of inventing a new tool name.",
@@ -286,6 +296,31 @@ def build_sql_tool_error(message: str) -> ToolResult:
         error=message,
         metadata={"error_type": "sql_error"},
     )
+
+
+class StandaloneQuestionConversationFilter(ConversationFilter):
+    """Treat standalone user questions as fresh requests instead of sticky follow-ups."""
+
+    def __init__(self, followup_window: int = 8):
+        self.followup_window = followup_window
+
+    async def filter_messages(self, messages: list[Message]) -> list[Message]:
+        if len(messages) <= 1:
+            return messages
+
+        last_user_index = next(
+            (index for index in range(len(messages) - 1, -1, -1) if messages[index].role == "user"),
+            None,
+        )
+        if last_user_index is None:
+            return messages
+
+        last_user_message = (messages[last_user_index].content or "").strip()
+        if is_context_dependent_followup_request(last_user_message):
+            start_index = max(0, last_user_index - self.followup_window)
+            return messages[start_index:]
+
+        return [messages[last_user_index]]
 
 
 class OllamaToolCallFallbackService(OllamaLlmService):
@@ -450,6 +485,15 @@ def looks_like_followup_run_sql_request(last_user_message: str, response_content
     return any(FOLLOWUP_RUN_SQL_PATTERN.search(haystack or "") for haystack in haystacks)
 
 
+def is_context_dependent_followup_request(message: str) -> bool:
+    normalized = normalize_whitespace(message).lower()
+    if not normalized:
+        return False
+    if looks_like_followup_run_sql_request(normalized, normalized):
+        return True
+    return bool(CONTEXT_DEPENDENT_FOLLOWUP_PATTERN.search(normalized))
+
+
 def extract_latest_assistant_sql(messages: list[LlmMessage]) -> str | None:
     for message in reversed(messages):
         if message.role != "assistant" or not message.content:
@@ -587,12 +631,16 @@ def build_schema_context_bundle(
         fallback_ddl = [entry.ddl for entry in search_schema_catalog(schema_catalog, question)]
         related_ddl = dedupe_text_items([*related_ddl, *fallback_ddl])
 
+    similar_pairs = filter_question_sql_pairs_for_context(
+        safe_list(vn.get_similar_question_sql, question=question),
+        related_ddl=related_ddl,
+        question=question,
+    )
+
     return {
         "related_ddl": related_ddl,
         "related_docs": dedupe_text_items(safe_list(vn.get_related_documentation, question=question)),
-        "similar_pairs": dedupe_question_sql_pairs(
-            safe_list(vn.get_similar_question_sql, question=question)
-        ),
+        "similar_pairs": similar_pairs,
     }
 
 
@@ -651,6 +699,41 @@ def dedupe_question_sql_pairs(items: list[Any], limit: int = 4) -> list[dict[str
             break
 
     return results
+
+
+def filter_question_sql_pairs_for_context(
+    items: list[Any],
+    related_ddl: list[str],
+    question: str,
+    limit: int = 4,
+) -> list[dict[str, str]]:
+    pairs = dedupe_question_sql_pairs(items, limit=max(limit * 3, limit))
+    if not pairs:
+        return []
+
+    allowed_tables = {
+        extract_table_name_from_ddl(ddl).lower()
+        for ddl in related_ddl
+        if extract_table_name_from_ddl(ddl) != "unknown_table"
+    }
+    question_tokens = tokenize_schema_text(question)
+    scored_pairs: list[tuple[int, dict[str, str]]] = []
+
+    for pair in pairs:
+        sql_tables = {table.lower() for table in extract_table_names_from_sql(pair["sql"])}
+        question_overlap = tokenize_schema_text(pair["question"]) & question_tokens
+        score = len(question_overlap)
+
+        if allowed_tables:
+            table_overlap = sql_tables & allowed_tables
+            if not table_overlap:
+                continue
+            score += 10 * len(table_overlap)
+
+        scored_pairs.append((score, pair))
+
+    scored_pairs.sort(key=lambda item: (-item[0], item[1]["question"], item[1]["sql"]))
+    return [pair for _, pair in scored_pairs[:limit]]
 
 
 def build_schema_catalog(vn: Any) -> list[SchemaCatalogEntry]:
@@ -965,6 +1048,7 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
         user_resolver=LocalAdminUserResolver(),
         system_prompt_builder=SqlChatSystemPromptBuilder(),
         llm_context_enhancer=SchemaAwareLlmContextEnhancer(vn, None),
+        conversation_filters=[StandaloneQuestionConversationFilter()],
         config=AgentConfig(
             max_tool_iterations=settings.chat_max_tool_iterations,
             stream_responses=True,

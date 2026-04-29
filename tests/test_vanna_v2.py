@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import pandas as pd
 from vanna.core.llm import LlmMessage, LlmResponse
+from vanna.core.storage import Message
 from vanna.core.tool import ToolCall
 from vanna.core.tool import ToolSchema
 from vanna.core.user import User
@@ -10,6 +11,8 @@ from vanna.core.user import User
 from app.vanna_v2 import (
     REQUEST_SCHEMA_CONTEXT_MARKER,
     REQUEST_SQL_FEEDBACK_MARKER,
+    filter_question_sql_pairs_for_context,
+    is_context_dependent_followup_request,
     SchemaAwareLlmContextEnhancer,
     build_schema_catalog,
     coerce_text_tool_calls,
@@ -17,6 +20,7 @@ from app.vanna_v2 import (
     is_read_only_sql,
     search_schema_catalog,
     SqlChatSystemPromptBuilder,
+    StandaloneQuestionConversationFilter,
 )
 
 
@@ -363,3 +367,67 @@ def test_is_read_only_sql_allows_single_selects_and_blocks_mutations():
     ) is True
     assert is_read_only_sql("UPDATE public.orders SET status = 'done';") is False
     assert is_read_only_sql("SELECT 1; DELETE FROM public.orders;") is False
+
+
+def test_filter_question_sql_pairs_for_context_drops_unrelated_examples():
+    related_ddl = [
+        'CREATE TABLE "public"."game_data" (\n    "match_id" uuid,\n    "bids" integer[]\n);',
+        'CREATE TABLE "public"."player" (\n    "id" uuid,\n    "username" varchar(255)\n);',
+    ]
+    pairs = [
+        {
+            "question": "Show leaderboard ranks with skill values.",
+            "sql": 'SELECT "player_id", "skill" FROM "public"."leaderboard_past";',
+        },
+        {
+            "question": "Show player bids from the latest game.",
+            "sql": 'SELECT "player_ids", "bids" FROM "public"."game_data" LIMIT 10;',
+        },
+    ]
+
+    filtered = filter_question_sql_pairs_for_context(
+        pairs,
+        related_ddl=related_ddl,
+        question="players who bid 10 or higher in their most recent game",
+    )
+
+    assert len(filtered) == 1
+    assert "game_data" in filtered[0]["sql"]
+    assert "leaderboard_past" not in filtered[0]["sql"]
+
+
+def test_standalone_question_filter_resets_unrelated_history():
+    messages = [
+        Message(role="user", content="show me leaderboard ranks"),
+        Message(role="assistant", content='```sql\nSELECT * FROM leaderboard_past;\n```'),
+        Message(role="user", content="players who bid 10 or higher in their most recent game"),
+    ]
+
+    filtered = asyncio.run(StandaloneQuestionConversationFilter().filter_messages(messages))
+
+    assert len(filtered) == 1
+    assert filtered[0].content == "players who bid 10 or higher in their most recent game"
+
+
+def test_standalone_question_filter_keeps_history_for_followups():
+    messages = [
+        Message(role="user", content="show me leaderboard ranks"),
+        Message(role="assistant", content='```sql\nSELECT * FROM leaderboard_past;\n```'),
+        Message(role="user", content="same but limit 1"),
+    ]
+
+    filtered = asyncio.run(StandaloneQuestionConversationFilter().filter_messages(messages))
+
+    assert len(filtered) == 3
+    assert filtered[-1].content == "same but limit 1"
+
+
+def test_is_context_dependent_followup_request_detects_followup_language():
+    assert is_context_dependent_followup_request("same but limit 1") is True
+    assert is_context_dependent_followup_request("run the above query") is True
+    assert (
+        is_context_dependent_followup_request(
+            "players who bid 10 or higher in their most recent game"
+        )
+        is False
+    )
