@@ -10,17 +10,34 @@ from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
+from vanna.capabilities.agent_memory import (
+    AgentMemory,
+    TextMemory,
+    TextMemorySearchResult,
+    ToolMemory,
+    ToolMemorySearchResult,
+)
+from vanna.capabilities.sql_runner import RunSqlToolArgs
+from vanna.components import (
+    ComponentType,
+    DataFrameComponent,
+    NotificationComponent,
+    SimpleTextComponent,
+    UiComponent,
+)
 from vanna import Agent, AgentConfig
 from vanna.core.enhancer import DefaultLlmContextEnhancer, LlmContextEnhancer
 from vanna.core.llm import LlmMessage, LlmRequest, LlmResponse, LlmStreamChunk
-from vanna.core.tool import ToolCall, ToolSchema
+from vanna.core.registry import ToolRegistry
+from vanna.core.system_prompt import SystemPromptBuilder
+from vanna.core.tool import Tool, ToolCall, ToolContext, ToolResult, ToolSchema
 from vanna.core.user import RequestContext, User
 from vanna.core.user.resolver import UserResolver
 from vanna.integrations.ollama import OllamaLlmService
-from vanna.legacy.adapter import LegacyVannaAdapter
 from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse
 
 from app.config import Settings
+from app.db import DatabaseClient, DatabaseConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +50,11 @@ DDL_TABLE_PATTERN = re.compile(
 DDL_COLUMN_PATTERN = re.compile(
     r"^\s*(?:\"|`)?(?P<name>[A-Za-z0-9_]+)(?:\"|`)?\s+[A-Za-z]",
     re.MULTILINE,
+)
+READ_ONLY_SQL_PATTERN = re.compile(r"^\s*(select|with|show|describe|desc|explain)\b", re.IGNORECASE)
+MUTATING_SQL_PATTERN = re.compile(
+    r"\b(insert|update|delete|alter|drop|truncate|create|grant|revoke|merge|replace|upsert)\b",
+    re.IGNORECASE,
 )
 DDL_SKIP_TOKENS = {"create", "table", "primary", "constraint", "foreign", "unique", "check"}
 REQUEST_SCHEMA_CONTEXT_MARKER = "[Attached schema context for this request]"
@@ -53,6 +75,207 @@ class RecentSqlAttempt:
     tables: tuple[str, ...]
     outcome: str
     detail: str
+
+
+class NoOpAgentMemory(AgentMemory):
+    async def save_tool_usage(
+        self,
+        question: str,
+        tool_name: str,
+        args: dict[str, Any],
+        context: ToolContext,
+        success: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        return None
+
+    async def save_text_memory(self, content: str, context: ToolContext) -> TextMemory:
+        return TextMemory(memory_id=None, content=content, timestamp=None)
+
+    async def search_similar_usage(
+        self,
+        question: str,
+        context: ToolContext,
+        *,
+        limit: int = 10,
+        similarity_threshold: float = 0.7,
+        tool_name_filter: str | None = None,
+    ) -> list[ToolMemorySearchResult]:
+        return []
+
+    async def search_text_memories(
+        self,
+        query: str,
+        context: ToolContext,
+        *,
+        limit: int = 10,
+        similarity_threshold: float = 0.7,
+    ) -> list[TextMemorySearchResult]:
+        return []
+
+    async def get_recent_memories(
+        self,
+        context: ToolContext,
+        limit: int = 10,
+    ) -> list[ToolMemory]:
+        return []
+
+    async def get_recent_text_memories(
+        self,
+        context: ToolContext,
+        limit: int = 10,
+    ) -> list[TextMemory]:
+        return []
+
+    async def delete_by_id(self, context: ToolContext, memory_id: str) -> bool:
+        return False
+
+    async def delete_text_memory(self, context: ToolContext, memory_id: str) -> bool:
+        return False
+
+    async def clear_memories(
+        self,
+        context: ToolContext,
+        tool_name: str | None = None,
+        before_date: str | None = None,
+    ) -> int:
+        return 0
+
+
+class SqlChatSystemPromptBuilder(SystemPromptBuilder):
+    async def build_system_prompt(
+        self,
+        user: User,
+        tools: list[ToolSchema],
+    ) -> str:
+        del user
+        tool_names = ", ".join(tool.name for tool in tools) or "run_sql"
+        return "\n".join(
+            [
+                "You are a careful SQL analyst assistant.",
+                "Use only the real schema context and the available SQL tool.",
+                "Call `run_sql` only when you still need information to answer the user.",
+                "If the first successful SQL result already answers the question, stop calling tools and answer directly.",
+                "Do not repeat an equivalent successful query.",
+                "Do not return JSON unless you are making a tool call.",
+                "The user can already see the query result table, so your final answer should summarize only the answer, key figures, and caveats.",
+                f"Available tools: {tool_names}",
+            ]
+        )
+
+
+class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
+    def __init__(self, db: DatabaseClient, max_rows: int):
+        self.db = db
+        self.max_rows = max_rows
+
+    @property
+    def name(self) -> str:
+        return "run_sql"
+
+    @property
+    def description(self) -> str:
+        return "Execute a single read-only SQL query against the configured database."
+
+    def get_args_schema(self) -> type[RunSqlToolArgs]:
+        return RunSqlToolArgs
+
+    async def execute(self, context: ToolContext, args: RunSqlToolArgs) -> ToolResult:
+        del context
+        sql = args.sql.strip()
+        if not is_read_only_sql(sql):
+            return build_sql_tool_error(
+                "Only single-statement read-only SQL is allowed here. Use SELECT, WITH, SHOW, DESCRIBE, or EXPLAIN."
+            )
+
+        try:
+            result = self.db.execute_sql(sql, max_rows=self.max_rows)
+        except (DatabaseConnectionError, ValueError) as exc:
+            return build_sql_tool_error(str(exc))
+
+        description = (
+            f"Returned {result.row_count} row(s)"
+            + (" (truncated to the configured limit)." if result.truncated else ".")
+            + f" Duration: {result.duration_ms} ms."
+        )
+
+        ui_component = UiComponent(
+            rich_component=DataFrameComponent(
+                rows=result.rows,
+                columns=result.columns,
+                title="Query Results",
+                description=description,
+                row_count=result.row_count,
+                column_count=len(result.columns),
+                max_rows_displayed=min(result.row_count or self.max_rows, 100),
+            ),
+            simple_component=SimpleTextComponent(text=description),
+        )
+
+        llm_lines = [
+            "SQL executed successfully. Use this result to answer the user's question.",
+            "Do not run another SQL query if this already answers the question.",
+            description,
+        ]
+        if result.columns:
+            llm_lines.append(f"Columns: {', '.join(result.columns)}")
+        if result.rows:
+            llm_lines.extend(
+                [
+                    "Rows:",
+                    "```json",
+                    json.dumps(result.rows[:10], default=str, indent=2),
+                    "```",
+                ]
+            )
+        else:
+            llm_lines.append(
+                "No rows were returned for this query. That only applies to this exact query."
+            )
+
+        return ToolResult(
+            success=True,
+            result_for_llm="\n".join(llm_lines),
+            ui_component=ui_component,
+            metadata={
+                "sql": sql,
+                "row_count": result.row_count,
+                "columns": result.columns,
+                "truncated": result.truncated,
+                "duration_ms": result.duration_ms,
+            },
+        )
+
+
+def is_read_only_sql(sql: str) -> bool:
+    statement = sql.strip()
+    if not statement:
+        return False
+
+    statement = statement.rstrip(";").strip()
+    if ";" in statement:
+        return False
+
+    return bool(READ_ONLY_SQL_PATTERN.match(statement)) and not bool(
+        MUTATING_SQL_PATTERN.search(statement)
+    )
+
+
+def build_sql_tool_error(message: str) -> ToolResult:
+    return ToolResult(
+        success=False,
+        result_for_llm=message,
+        ui_component=UiComponent(
+            rich_component=NotificationComponent(
+                type=ComponentType.NOTIFICATION,
+                level="error",
+                message=message,
+            ),
+            simple_component=SimpleTextComponent(text=message),
+        ),
+        error=message,
+        metadata={"error_type": "sql_error"},
+    )
 
 
 class OllamaToolCallFallbackService(OllamaLlmService):
@@ -227,6 +450,7 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             "- If a SQL execution error mentions a missing table or column, treat it as a schema mismatch and correct the query before drawing conclusions.",
             "- Never conclude that a table is empty just because a previous SQL statement failed.",
             "- Treat recent SQL errors and empty-result attempts as negative evidence. Do not repeat the same query path unchanged.",
+            "- If a successful SQL result already answers the question, stop and respond instead of running another query.",
             "- If the schema context is still insufficient, prefer a read-only metadata query against `information_schema` or relevant catalog views before guessing.",
         ]
 
@@ -590,10 +814,12 @@ def classify_run_sql_outcome(content: str) -> str | None:
     normalized = " ".join((content or "").strip().lower().split())
     if not normalized:
         return None
-    if "results saved to file:" in normalized or "rows affected" in normalized:
-        return None
     if "no rows returned" in normalized or "0 rows" in normalized:
         return "empty"
+    if "sql executed successfully." in normalized or "query executed successfully." in normalized:
+        return None
+    if "results saved to file:" in normalized or "rows affected" in normalized:
+        return None
     return "error"
 
 
@@ -652,8 +878,13 @@ class LocalAdminUserResolver(UserResolver):
         )
 
 
-def build_vanna_v2_chat_handler(vn: Any, settings: Settings) -> ChatHandler:
-    legacy_adapter = LegacyVannaAdapter(vn)
+def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings) -> ChatHandler:
+    agent_memory = NoOpAgentMemory()
+    tool_registry = ToolRegistry()
+    tool_registry.register_local_tool(
+        ReadOnlySqlTool(db=db, max_rows=settings.max_result_rows),
+        access_groups=["user", "admin"],
+    )
     llm_service = OllamaToolCallFallbackService(
         model=settings.normalized_ollama_model,
         host=settings.ollama_host,
@@ -663,11 +894,13 @@ def build_vanna_v2_chat_handler(vn: Any, settings: Settings) -> ChatHandler:
     )
     agent = Agent(
         llm_service=llm_service,
-        tool_registry=legacy_adapter,
-        agent_memory=legacy_adapter,
+        tool_registry=tool_registry,
+        agent_memory=agent_memory,
         user_resolver=LocalAdminUserResolver(),
-        llm_context_enhancer=SchemaAwareLlmContextEnhancer(vn, legacy_adapter),
+        system_prompt_builder=SqlChatSystemPromptBuilder(),
+        llm_context_enhancer=SchemaAwareLlmContextEnhancer(vn, None),
         config=AgentConfig(
+            max_tool_iterations=settings.chat_max_tool_iterations,
             stream_responses=True,
             include_thinking_indicators=False,
         ),

@@ -78,10 +78,6 @@ def summarize_training(vn: Any) -> dict[str, Any]:
     }
 
 
-def training_data_exists(vn: Any) -> bool:
-    return summarize_training(vn)["total_entries"] > 0
-
-
 def add_question_sql_if_missing(vn: Any, question: str, sql: str) -> bool:
     training_df = get_training_dataframe(vn)
     index = ExistingTrainingIndex.from_dataframe(training_df)
@@ -311,7 +307,12 @@ def ensure_training_ready(vn: Any, db: DatabaseClient, settings: Settings) -> di
             include_training_data_files=settings.include_training_files_on_start,
         )
 
-    raise TrainingBootstrapError(
-        "No Vanna training data was found in the local Chroma store. "
-        "Run `python scripts/bootstrap_training.py` first or set TRAIN_ON_START=true."
-    )
+    logger.info("No training data found and TRAIN_ON_START=false. Skipping bootstrap.")
+    return {
+        "status": "skipped",
+        "source": "disabled",
+        "training": current_summary,
+        "bootstrap_inputs": {
+            "include_training_data_files": settings.include_training_files_on_start,
+        },
+    }

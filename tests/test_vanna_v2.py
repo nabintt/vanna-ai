@@ -14,7 +14,9 @@ from app.vanna_v2 import (
     build_schema_catalog,
     coerce_text_tool_calls,
     extract_text_tool_calls,
+    is_read_only_sql,
     search_schema_catalog,
+    SqlChatSystemPromptBuilder,
 )
 
 
@@ -301,3 +303,30 @@ def test_schema_aware_enhancer_appends_recent_sql_feedback():
     assert "Do not repeat the same join/filter unchanged" in final_content
     assert "`leaderboard_past`" in final_content
     assert "`top_skilled_player_games`" in final_content
+
+
+def test_sql_chat_system_prompt_builder_prefers_single_successful_query():
+    prompt = asyncio.run(
+        SqlChatSystemPromptBuilder().build_system_prompt(
+            User(
+                id="u1",
+                username="analyst",
+                email="analyst@example.com",
+                group_memberships=["user"],
+            ),
+            build_tool_schemas()[:1],
+        )
+    )
+
+    assert "stop calling tools and answer directly" in prompt
+    assert "Do not repeat an equivalent successful query." in prompt
+    assert "save_question_tool_args" not in prompt
+
+
+def test_is_read_only_sql_allows_single_selects_and_blocks_mutations():
+    assert is_read_only_sql("SELECT * FROM public.orders LIMIT 10;") is True
+    assert is_read_only_sql(
+        "WITH recent AS (SELECT * FROM public.orders) SELECT * FROM recent;"
+    ) is True
+    assert is_read_only_sql("UPDATE public.orders SET status = 'done';") is False
+    assert is_read_only_sql("SELECT 1; DELETE FROM public.orders;") is False

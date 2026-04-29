@@ -1,157 +1,142 @@
-# Business Glossary for prod_clone
+# Business Glossary
 
-These notes were inferred on 2026-04-27 by inspecting the `public` schema, enum values, foreign keys, indexes, and view definitions in `prod_clone`.
+These notes are schema-derived guidance for SQL generation. Use direct table and view names without `public.` prefixes. Prefer read-only analytical SQL.
 
-Treat this as schema-derived training context, not product-owner-validated business truth. Validate naming, metric definitions, and any inferred semantics before relying on them for production analytics.
+Treat similarly named tables with care. Similar names do not imply a valid join path, and an empty result does not prove the table is wrong.
 
 ---
 
 General query rules:
 
-- Prefer fully qualified table and view names in the `public` schema.
+- Use unqualified table and view names such as `player`, `game`, `player_skills`, and `leaderboard_past`.
 - `player.id` is the canonical player key across most player-facing tables.
-- Prefer read-only analytical queries.
+- If the question needs `username`, `email`, provider, or geography, join to `player` unless the target view already exposes that field.
+- Prefer the table or view that already contains the requested metric instead of inventing an extra join to a similarly named object.
+- Do not treat an empty result as proof that a feature or table has no data. First check whether the filter, date range, or join path was too narrow.
 - Prefer curated views when they already expose parsed JSON or pre-aggregated metrics.
-- Avoid one-off diagnostic views with embedded historical dates unless the question explicitly asks for those objects.
-
----
-
-Repository-wide schema context:
-
-- The `public` schema contains 99 base tables and 26 views in this clone.
-- No table or column comments were present, so business meaning here is inferred from names, keys, enum labels, and view SQL.
-- Some configuration or staging tables appear sparse in this clone. Absence of rows should not be interpreted as absence of the feature without validation.
+- Prefer read-only SQL. Do not generate `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, or DDL for normal question answering.
 
 ---
 
 Player and account domain:
 
-- `public.player` is the core player/account entity.
-- `player` stores profile fields, provider, geography, availability, gameplay status, OS, version, and account timestamps.
-- Join `player.provider_id -> login_provider.id` for provider labels: `GUEST`, `GOOGLE`, `FACEBOOK`, `APPLE`, `TWITTER`.
-- Join `player.availability_id -> availability.id` for availability labels: `OFFLINE`, `ONLINE`, `DND`, `INVISIBLE`, `AWAY`.
-- Join `player.gameplay_status_id -> gameplay_status.id` for gameplay labels currently stored in the lookup table: `IDLE`, `IN_GAME`, `IN_LOBBY`.
-- Join `player.country_id -> country.id` and `country.continent_id -> continent.id` for geography.
-- `player.identifier` is a UUID-style identifier, while `player.id` is the main integer PK used across the schema.
+- `player` is the core account and profile table.
+- `player` stores identity, provider, availability, gameplay status, geography, OS, version, and account timestamps.
+- `player` includes both `country_id` and `continent_id`.
+- Join `player.provider_id -> login_provider.id` for provider labels.
+- Join `player.availability_id -> availability.id` for availability labels.
+- Join `player.gameplay_status_id -> gameplay_status.id` for gameplay labels.
+- Join `player.country_id -> country.id` for country names.
+- Join `player.continent_id -> continent.id` for continent names.
 - `player_login` is the login event table and should be used for login-event analysis.
-- `player.last_online` is a last-known timestamp, not a login event stream.
+- `player.last_online` is a last-known activity timestamp, not a login event stream.
 - `linked_account` stores provider-linked account payloads for players.
 
 ---
 
 Preference and settings domain:
 
-- `user_preference` stores gameplay toggles like autoplay, reduced ads preference, and `game_speed`.
-- The observed `game_speed` enum values are `SLOWER`, `NORMAL`, and `FAST`.
-- `user_settings` stores UI and UX settings such as sound, vibration, push notifications, timer style, background theme, and card theme.
-- `view_user_pref` exposes players with non-null background or card theme values.
+- `user_preference` stores gameplay preferences such as `game_speed`.
+- `user_settings` stores UX toggles such as sound, vibration, timer style, push notification state, background theme, and card theme.
+- `view_user_pref` is a curated preference view and only exposes `player_id`, `background_theme`, and `card_theme`.
 
 ---
 
 Gameplay domain:
 
-- `public.game` is the main gameplay fact table.
-- Join `game.player_id -> player.id`, `game.game_mode_id -> game_mode.id`, `game.game_scope_id -> game_scope.id`, and `game.game_data_id -> game_data.id`.
-- `game_mode` values include `STANDARD`, `QUICK`, `EIGHT_BID_CALL`, `EIGHT_BID_BREAK`, `TRANING`, and `TUTORIAL`.
-- `game_scope` values include `VS_BOTS`, `VS_HUMANS`, `PRIVATE`, `LAN`, and `CHALLENGE`.
-- `game.completed` and `game.canceled` are separate booleans. Do not assume they are perfect inverses without validating application logic.
-- `game.players`, `game.all_ranks`, `game.scores`, and `game.all_skills` are JSON payloads that describe match participants and outcomes.
-- `game_data` contains array-heavy match payload details keyed by `match_id`.
-- `view_day3_games_played` and `view_day7_games_played` are reusable onboarding-engagement views, but their column names are quoted display-style labels with spaces.
+- `game` is the main gameplay fact table.
+- Join `game.player_id -> player.id`, `game.game_mode_id -> game_mode.id`, and `game.game_scope_id -> game_scope.id`.
+- `game.completed` and `game.canceled` are separate flags and should not be assumed to be perfect inverses.
+- `game.players`, `game.all_ranks`, `game.scores`, and `game.all_skills` are JSON payloads that describe participants and outcomes.
+- `game_data` stores match payload details keyed by `match_id`.
+- `top_skilled_player_games` is a curated gameplay-oriented object that already contains `username`, `player_id`, `skill`, `highest_bid`, `started_at`, mode and scope ids, and gameplay payload fields.
+- Use `top_skilled_player_games` when the question is explicitly about sampled top-skilled game rows, last sampled games, or payloads already present there.
+- `view_day3_games_played` and `view_day7_games_played` are curated onboarding-engagement views with quoted display-style column names.
 
 ---
 
 Statistics, skills, achievements, and leaderboard domain:
 
-- `statistics` is an aggregate player-performance table keyed by player, mode, scope, and `time_range_id`.
-- `player_skills` is a curated analytics view for current human-versus-human skill and matchmaking latency.
-- `player_skills` filters `statistics.game_scope_id = 2` (`VS_HUMANS`) and `statistics.time_range_id = 0`, then adds wait-time percentiles from `ticket_activity`.
+- `statistics` is an aggregate performance table keyed by player, mode, scope, and `time_range_id`.
+- `player_skills` is the preferred curated view for current human-versus-human skill and matchmaking latency.
+- `player_skills` exposes `mu`, `sigma`, `total_games`, `total_completed`, and wait-time percentiles such as `wait_time_p25`, `wait_time_p50`, `wait_time_p75`, `wait_time_p99`, and `max_wait_time`.
 - `achievements` stores rank and percentile data by metric, geography, mode, scope, and player.
-- `metrics` values include `SKILL`, `HIGHEST_SCORE`, `AVERAGE_SCORE`, `LOWEST_SCORE_TO_WIN`, `WIN_RATIO`, `HIGHEST_BID`, `MAX_WINNING_STREAK`, `MAX_LOSING_STREAK`, `COMPLETION_RATIO`, and `RESPONSE_TIME`.
-- `leaderboard1`, `leaderboard2`, and `leaderboard_past` have an achievements-like shape.
-- `leaderboard_metadata` tracks refresh timestamps and leaderboard processing state.
-- The semantic difference between `leaderboard1` and `leaderboard2` is not documented in schema names alone, so prefer `statistics`, `achievements`, or `player_skills` unless a question explicitly asks for those tables.
+- `leaderboard_past` is a leaderboard snapshot table with numeric measures such as `skill`, `highest_bid`, `win_ratio`, and rank and percentile fields, plus `metric_id`, `game_mode_id`, `game_scope_id`, `country_id`, `continent_id`, and `player_id`.
+- `leaderboard_metadata` tracks leaderboard refresh state and timestamps.
+- `leaderboard1`, `leaderboard2`, and `leaderboard_past` are similarly named and should not be swapped casually.
+- If the question asks for current skill ranking, prefer `player_skills`.
+- If the question asks for stored leaderboard snapshot values, world rank, country rank, continent rank, or other rank columns, use `leaderboard_past`.
+- For usernames on leaderboard rows, join `leaderboard_past.player_id = player.id`.
+- Do not join `leaderboard_past` to `top_skilled_player_games` just to find `username`. `top_skilled_player_games` is a different object with its own purpose.
 
 ---
 
 Matchmaking domain:
 
-- `match_making`, `tickets`, `ticket_guest`, `stake_ticket`, and `ticket_activity` are matchmaking objects, not customer support tables.
-- `ticket_activity.status` values are `MERGED`, `CANCELLED`, and `NOTFOUND`.
+- `match_making`, `tickets`, `ticket_guest`, `stake_ticket`, and `ticket_activity` are matchmaking objects, not customer-support tickets.
+- `ticket_activity` is useful for wait-time, disconnect, reconnect, and matchmaking outcome analysis.
 - `ticket_activity.uid` is text. When joining it to `player`, cast with `player.id::text`.
-- `tickets` and `ticket_guest` represent open or historical ticket rows with gameplay-fit metrics like skill, response time, and completion ratio.
-- `view_player_with_mm_issue`, `view_users_each_issue`, and `view_each_players_issue_count` are reusable issue-analysis views.
-- `view_top_20_p_id`, `view_top_20_90_days`, `view_top_20_last_90_days_median_wt_twt`, and `view_5_20_top_g_status` contain embedded historical date logic and should be treated as one-off diagnostic views.
+- `view_player_with_mm_issue`, `view_users_each_issue`, and `view_each_players_issue_count` are matchmaking issue-analysis views.
 
 ---
 
 Social and referral domain:
 
-- `friend_requests` stores sender and receiver pairs plus `status_id -> friend_request_status.id`.
-- `friend_request_status` values are `PENDING`, `ACCEPTED`, `REJECTED`, `BLOCKED`, `UNFRIENDED`, and `CANCELED`.
-- `friend` represents connected relationships, with `connected_date` as the relationship timestamp.
+- `friend_requests` stores sender and receiver pairs plus status.
+- `friend` stores connected relationships and `connected_date`.
 - `referral` links `referred_by` and `referred_to` back to `player.id`.
-- Observed live `referral.status` values in this clone are `PENDING` and `CLAIMED`.
-- `referral_reward` stores reward-value configuration, but `referral.reward_value` is also present on the fact table.
+- `referral_reward` is reward configuration, while `referral` is the activity fact table.
 
 ---
 
 Currency, rewards, and progression domain:
 
-- `player_vault` stores one current gem-balance row per player. There is a unique index on `player_vault.player_id`.
-- `player_vault` includes `gems`, `unclaimed_gems`, and `unprocessed_playsuper_gems`.
-- `wallet` also stores one current row per player and includes both `gem` and `coin`. There is a unique index on `wallet.player_id`.
+- `player_vault` stores a current gem-balance row per player and includes `gems`, `unclaimed_gems`, and `unprocessed_playsuper_gems`.
+- `wallet` stores a current balance row per player and includes both `coin` and `gem`.
 - `gem_transaction` is the gem movement history table.
-- `daily_reward` stores per-player reward streak state and is unique on `player_id`.
+- `daily_reward` stores per-player reward streak state.
 - `daily_rewards_transaction` stores reward claim history and joins to `rewards`.
-- `rewards` stores reward configuration fields such as `reward_type`, `reward_version`, `coin_value`, `gem_value`, and reward multipliers.
+- `rewards` stores reward configuration such as `reward_type`, `reward_version`, `coin_value`, and `gem_value`.
 
 ---
 
 Store, offers, purchases, and campaigns domain:
 
-- `offer`, `store_item`, `asset`, `gem_packs`, `iap_products`, and `tags` describe store and catalog configuration.
+- `offer`, `store_item`, `asset`, `gem_packs`, `iap_products`, and `tags` are store and catalog configuration objects.
 - `store_item` links to both `asset` and `offer`.
-- `campaigns` stores live-ops campaign definitions with start and end windows, target audience, and version constraints.
-- `campaign_assets` maps `campaigns.id` to `asset.product_id`.
-- `campaigns.target_audience` values are `GENERAL` and `PLAY_SUPER`.
-- `store_campaign` is a separate store-promo asset table with URI windows.
-- `app_store_purchases` is a purchase fact table with observed statuses `CANCELED`, `PURCHASED`, and `PENDING`.
-- Observed `app_store_purchases.purchase_source` values are `INAPP` and `PLAYGAP`.
+- `campaigns` stores live-ops campaign definitions with date windows, targeting, and version constraints.
+- `campaign_assets` maps campaigns to product assets.
+- `app_store_purchases` is raw purchase fact data.
 - `purchase_status` stores raw purchase payload JSON.
-- `product_purchases` is the parsed view over `purchase_status` and exposes fields like `purchase_state`, `purchase_type`, `order_id`, and `region_code`.
-- `view_yesterday_iap` is already filtered to yesterday and maps provider and purchase-state codes to readable labels.
-- `voided_purchases` stores voided purchase payloads.
-- `purchase_transfer` tracks product ownership transfers between players.
+- `product_purchases` is the parsed purchase view and is usually easier to query than raw payload JSON.
+- `view_yesterday_iap` is a curated prior-day IAP view and already exposes player and provider fields.
+- `voided_purchases` and `purchase_transfer` are separate purchase lifecycle tables.
 
 ---
 
 PlaySuper domain:
 
-- `playsuper_transaction` and `playsuper_all_transaction` store PlaySuper coin movements, balances, reasons, and event types.
-- `playsuper_brands` stores brand metadata, listing state, image links, and priority.
-- `player_vault.unprocessed_playsuper_gems` suggests PlaySuper activity can affect player gem balances.
+- `playsuper_transaction` and `playsuper_all_transaction` store PlaySuper coin movement and delta data.
+- `playsuper_brands` stores PlaySuper brand metadata, listing state, and priority.
+- `player_vault.unprocessed_playsuper_gems` connects PlaySuper activity to player-balance context.
 
 ---
 
 Feedback, support, app telemetry, and operations domain:
 
-- `app_rating` stores player star ratings plus provider, OS, version, device, and redirect fields.
-- `bug_report` is the main free-text player issue table with `subject` and `body`.
-- `view_ads`, `view_ads_filter_1`, `view_ads_filter_2`, and `view_ads_filter_3` are text-filtering support views for ad-related issues.
-- `support_message` stores purchase and support issues and is separate from matchmaking ticket tables.
-- `api_profile` is operational telemetry for application APIs and endpoints.
-- `api_profile.api_name` and `api_profile.api_status` are enums, so this table is better for app-operation analysis than for gameplay facts.
-- `app_install` is install telemetry by platform and version.
+- `app_rating` stores player star ratings and client context.
+- `bug_report` is the main free-text player issue table.
+- `support_message` stores support and purchase issue messages and is separate from matchmaking ticket tables.
+- `api_profile` is application API performance and status telemetry.
+- `app_install` is install telemetry by platform and version code.
 
 ---
 
 Events, surveys, themes, and notifications domain:
 
-- `events` stores event names, active dates, assets, and trigger dates.
-- `events_login`, `aniversary_login`, and `user_events` capture per-player event participation and claim state.
+- `events`, `events_login`, `aniversary_login`, and `user_events` capture event participation and claim state.
 - The table name is spelled `aniversary_login` in the schema and should be referenced exactly that way in SQL.
-- `surveys` stores survey definitions, while `survey_responses` stores response payloads, entry points, and attached user context.
+- `surveys` stores survey definitions, while `survey_responses` stores response payloads and entry-point context.
 - `themes` defines theme availability windows and remote-config dependency paths.
 - `holiday`, `notification`, and `version` support holiday notifications by country, OS, version, and trigger time.
 
@@ -159,15 +144,16 @@ Events, surveys, themes, and notifications domain:
 
 Views to prefer for training examples:
 
-- `public.player_skills` for current human-versus-human skill plus wait-time percentiles.
-- `public.product_purchases` for parsed purchase JSON fields.
-- `public.view_yesterday_iap` for prior-day IAP slices.
-- `public.view_user_pref` for theme-preference questions.
-- `public.view_day3_games_played` and `public.view_day7_games_played` for early-engagement questions.
+- `player_skills` for current human-versus-human skill plus wait-time percentiles.
+- `product_purchases` for parsed purchase JSON fields.
+- `view_yesterday_iap` for prior-day IAP slices.
+- `view_user_pref` for theme-preference questions.
+- `view_day3_games_played` and `view_day7_games_played` for early-engagement questions.
 
 ---
 
-Views to use with caution:
+Views and patterns to use with caution:
 
-- `public.view_top_20_p_id`, `public.view_top_20_90_days`, `public.view_top_20_last_90_days_median_wt_twt`, and `public.view_5_20_top_g_status` contain hardcoded 2025 date logic.
-- `public.pg_stat_statements` and `public.pg_stat_statements_info` are database diagnostics, not product/business objects.
+- Diagnostic views with embedded fixed dates, such as `view_top_20_p_id`, `view_top_20_90_days`, `view_top_20_last_90_days_median_wt_twt`, and `view_5_20_top_g_status`.
+- Database diagnostic objects such as `pg_stat_statements` and `pg_stat_statements_info`, which are not gameplay or business entities.
+- Sparse or empty views. A zero-row result should not be narrated as "the table has no data" unless the schema and filters were checked carefully first.

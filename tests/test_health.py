@@ -25,6 +25,11 @@ class FakeVanna:
         )
 
 
+class EmptyFakeVanna:
+    def get_training_data(self):
+        return pd.DataFrame([])
+
+
 class FakeDatabase(DatabaseClient):
     def __init__(self):
         self.settings = None
@@ -82,3 +87,42 @@ def test_ready_endpoint_returns_success_with_mocked_ollama():
 
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
+
+
+def test_ready_endpoint_allows_empty_training_when_bootstrap_is_disabled():
+    settings = Settings(
+        _env_file=None,
+        db_name="analytics",
+        db_user="analyst",
+        db_password="secret",
+        train_on_start=False,
+    )
+    services = AppServices(
+        settings=settings,
+        db=FakeDatabase(),
+        vn=EmptyFakeVanna(),
+        vanna_v2_chat_handler=object(),
+        started_at=datetime.now(UTC),
+    )
+    app = create_app(services=services, settings=settings)
+
+    with TestClient(app) as client:
+        with patch(
+            "app.health.inspect_ollama",
+            return_value={
+                "ready": True,
+                "reachable": True,
+                "configured_host": "http://localhost:11434",
+                "requested_models": ["llama3.2:latest"],
+                "installed_models": ["llama3.2:latest"],
+                "missing_models": [],
+                "error": None,
+            },
+        ):
+            response = client.get("/ready")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["status"] == "ready"
+    assert payload["checks"]["training"]["available"] is False
+    assert payload["checks"]["training"]["required"] is False

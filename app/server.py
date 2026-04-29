@@ -48,7 +48,7 @@ class TrainRequest(BaseModel):
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=3)
-    auto_train: bool = True
+    auto_train: bool = False
     allow_llm_to_see_data: bool = False
     max_rows: int = Field(default=200, ge=1, le=1000)
 
@@ -81,7 +81,7 @@ def build_services(settings: Settings | None = None) -> AppServices:
         settings=settings,
         db=db,
         vn=vn,
-        vanna_v2_chat_handler=build_vanna_v2_chat_handler(vn, settings),
+        vanna_v2_chat_handler=build_vanna_v2_chat_handler(vn, db, settings),
         started_at=datetime.now(UTC),
     )
 

@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 
 import pandas as pd
-import pytest
 from vanna.legacy.types import TrainingPlan, TrainingPlanItem
 
 from app.config import Settings
-from app.training import TrainingBootstrapError, bootstrap_training, ensure_training_ready
+from app.training import bootstrap_training, ensure_training_ready
 
 
 class FakeVanna:
@@ -179,13 +178,16 @@ def test_bootstrap_training_is_idempotent_for_same_inputs(tmp_path):
     assert first_counts == second_counts
 
 
-def test_ensure_training_ready_raises_when_empty_and_train_on_start_is_disabled(tmp_path):
+def test_ensure_training_ready_skips_when_empty_and_train_on_start_is_disabled(tmp_path):
     settings = build_settings(tmp_path, train_on_start=False)
     vn = FakeVanna()
     db = FakeDatabase()
 
-    with pytest.raises(TrainingBootstrapError):
-        ensure_training_ready(vn=vn, db=db, settings=settings)
+    summary = ensure_training_ready(vn=vn, db=db, settings=settings)
+
+    assert summary["status"] == "skipped"
+    assert summary["source"] == "disabled"
+    assert summary["training"]["total_entries"] == 0
 
 
 def test_ensure_training_ready_skips_local_training_files_on_startup(tmp_path):

@@ -15,7 +15,7 @@ The important design choice is that this project uses the new Vanna 2 chat/serve
 - `make run` starts one FastAPI server.
 - `GET /` serves the Vanna 2 chat UI.
 - `GET /docs` serves FastAPI Swagger docs for the repo's API endpoints.
-- Training still writes into the local Chroma vector store under `data/chroma/`.
+- Existing training data in `data/chroma/` is still used when present, but automatic training is off by default.
 
 There is no separate Flask UI server anymore.
 
@@ -84,7 +84,7 @@ DB_PORT=5432
 DB_NAME=vanna_local
 DB_USER=vanna
 DB_PASSWORD=vanna
-TRAIN_ON_START=true
+TRAIN_ON_START=false
 ALLOW_BOOTSTRAP_SAMPLE_DATA=true
 ```
 
@@ -214,7 +214,7 @@ Ask and run SQL:
 ```bash
 curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
-  -d '{"question":"Show 10 rows from public.orders.","auto_train":true}'
+  -d '{"question":"Show 10 rows from public.orders."}'
 ```
 
 Run raw SQL:
@@ -250,6 +250,6 @@ make test
 3. Copy `.env.example` to `.env` and fill in your DB credentials.
 4. Make sure your database is reachable.
 5. Run `make check-ollama`.
-6. Run `make train`.
+6. Run `make train` only if you want to refresh the local Chroma training data.
 7. Run `make run`.
 8. Open `http://localhost:8000/`.

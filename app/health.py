@@ -38,7 +38,9 @@ def build_ready_payload(settings: Settings, db: DatabaseClient, vn: Any) -> tupl
 
     training_status = summarize_training(vn)
     training_payload = {
-        "ready": training_status["total_entries"] > 0,
+        "ready": training_status["total_entries"] > 0 or not settings.train_on_start,
+        "required": settings.train_on_start,
+        "available": training_status["total_entries"] > 0,
         **training_status,
     }
 

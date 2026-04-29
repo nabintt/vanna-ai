@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     db_user: str = Field(default="", validation_alias="DB_USER")
     db_password: str = Field(default="", validation_alias="DB_PASSWORD")
 
-    train_on_start: bool = Field(default=True, validation_alias="TRAIN_ON_START")
+    train_on_start: bool = Field(default=False, validation_alias="TRAIN_ON_START")
     include_training_files_on_start: bool = Field(
         default=False,
         validation_alias="INCLUDE_TRAINING_FILES_ON_START",
@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     )
     max_result_rows: int = Field(default=200, validation_alias="MAX_RESULT_ROWS")
     vanna_top_k: int = Field(default=10, validation_alias="VANNA_TOP_K")
+    chat_max_tool_iterations: int = Field(
+        default=4,
+        validation_alias="CHAT_MAX_TOOL_ITERATIONS",
+    )
 
     chroma_path: Path = Field(default=BASE_DIR / "data" / "chroma", validation_alias="CHROMA_PATH")
     training_data_dir: Path = Field(
