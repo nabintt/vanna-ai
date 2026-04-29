@@ -96,6 +96,15 @@ VANNA_UI_SUBTITLE=Ask questions in natural language using the Vanna 2 chat inter
 VANNA_UI_CDN_URL=https://img.vanna.ai/vanna-components.js
 ```
 
+Long-running query settings:
+
+```dotenv
+DB_STATEMENT_TIMEOUT_MS=0
+SSE_KEEPALIVE_SECONDS=15
+```
+
+`DB_STATEMENT_TIMEOUT_MS=0` disables the Postgres statement timeout for this app session, and `SSE_KEEPALIVE_SECONDS` keeps the browser chat stream alive while a query is still running.
+
 ## Start Ollama
 
 Install Ollama for your platform, then pull at least the chat model:

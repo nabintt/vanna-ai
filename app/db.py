@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import logging
 from time import perf_counter
 from typing import Any
 
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseConnectionError(RuntimeError):
@@ -39,6 +42,12 @@ class SqlExecutionResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def build_statement_timeout_sql(db_type: str, timeout_ms: int) -> str | None:
+    if db_type != "postgres":
+        return None
+    return f"SET statement_timeout = {max(timeout_ms, 0)}"
 
 
 def quote_identifier(db_type: str, identifier: str) -> str:
@@ -189,6 +198,7 @@ class DatabaseClient:
     def test_connection(self) -> None:
         try:
             with self.engine.connect() as connection:
+                self._configure_connection(connection)
                 connection.execute(text("SELECT 1"))
         except SQLAlchemyError as exc:
             raise DatabaseConnectionError(
@@ -204,6 +214,7 @@ class DatabaseClient:
         started = perf_counter()
         try:
             with self.engine.connect() as connection:
+                self._configure_connection(connection)
                 result = connection.execute(text(sql))
                 duration_ms = round((perf_counter() - started) * 1000, 2)
                 if result.returns_rows:
@@ -238,13 +249,30 @@ class DatabaseClient:
         query = self._postgres_information_schema_query()
         if self.settings.normalized_db_type == "mysql":
             query = self._mysql_information_schema_query()
-        return pd.read_sql_query(text(query), self.engine)
+        with self.engine.connect() as connection:
+            self._configure_connection(connection)
+            return pd.read_sql_query(text(query), connection)
 
     def fetch_table_constraints(self) -> pd.DataFrame:
         query = self._postgres_constraint_query()
         if self.settings.normalized_db_type == "mysql":
             query = self._mysql_constraint_query()
-        return pd.read_sql_query(text(query), self.engine)
+        with self.engine.connect() as connection:
+            self._configure_connection(connection)
+            return pd.read_sql_query(text(query), connection)
+
+    def _configure_connection(self, connection: Connection) -> None:
+        timeout_sql = build_statement_timeout_sql(
+            self.settings.normalized_db_type,
+            self.settings.db_statement_timeout_ms,
+        )
+        if timeout_sql is None:
+            return
+
+        try:
+            connection.execute(text(timeout_sql))
+        except SQLAlchemyError:
+            logger.warning("Failed to configure statement timeout", exc_info=True)
 
     @staticmethod
     def _postgres_information_schema_query() -> str:

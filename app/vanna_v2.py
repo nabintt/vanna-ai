@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import traceback
+from contextlib import suppress
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, AsyncGenerator
@@ -35,6 +37,7 @@ from vanna.core.user import RequestContext, User
 from vanna.core.user.resolver import UserResolver
 from vanna.integrations.ollama import OllamaLlmService
 from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.config import Settings
 from app.db import DatabaseClient, DatabaseConnectionError
@@ -189,7 +192,7 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
             )
 
         try:
-            result = self.db.execute_sql(sql, max_rows=self.max_rows)
+            result = await run_in_threadpool(self.db.execute_sql, sql, self.max_rows)
         except (DatabaseConnectionError, ValueError) as exc:
             return build_sql_tool_error(str(exc))
 
@@ -908,6 +911,39 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
     return ChatHandler(agent)
 
 
+async def stream_with_keepalive(
+    stream: AsyncGenerator[Any, None],
+    keepalive_seconds: float,
+) -> AsyncGenerator[Any | None, None]:
+    if keepalive_seconds <= 0:
+        async for item in stream:
+            yield item
+        return
+
+    stream_iter = stream.__aiter__()
+    pending = asyncio.create_task(stream_iter.__anext__())
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=keepalive_seconds)
+            if pending not in done:
+                yield None
+                continue
+
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                break
+
+            yield item
+            pending = asyncio.create_task(stream_iter.__anext__())
+    finally:
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+
+
 def build_vanna_v2_index_html(settings: Settings) -> str:
     title = html_escape(settings.vanna_ui_title)
     subtitle = html_escape(settings.vanna_ui_subtitle)
@@ -1092,7 +1128,13 @@ def register_vanna_v2_routes(app: FastAPI, settings: Settings) -> None:
 
         async def generate() -> AsyncGenerator[str, None]:
             try:
-                async for chunk in chat_handler.handle_stream(chat_request):
+                async for chunk in stream_with_keepalive(
+                    chat_handler.handle_stream(chat_request),
+                    settings.sse_keepalive_seconds,
+                ):
+                    if chunk is None:
+                        yield ": keep-alive\n\n"
+                        continue
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as exc:

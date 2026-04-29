@@ -57,11 +57,19 @@ class Settings(BaseSettings):
         default=True,
         validation_alias="ALLOW_BOOTSTRAP_SAMPLE_DATA",
     )
+    db_statement_timeout_ms: int = Field(
+        default=0,
+        validation_alias="DB_STATEMENT_TIMEOUT_MS",
+    )
     max_result_rows: int = Field(default=200, validation_alias="MAX_RESULT_ROWS")
     vanna_top_k: int = Field(default=10, validation_alias="VANNA_TOP_K")
     chat_max_tool_iterations: int = Field(
         default=4,
         validation_alias="CHAT_MAX_TOOL_ITERATIONS",
+    )
+    sse_keepalive_seconds: float = Field(
+        default=15.0,
+        validation_alias="SSE_KEEPALIVE_SECONDS",
     )
 
     chroma_path: Path = Field(default=BASE_DIR / "data" / "chroma", validation_alias="CHROMA_PATH")

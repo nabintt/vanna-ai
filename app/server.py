@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.agent import connect_vanna_to_database, create_vanna_agent
 from app.config import Settings, get_settings
@@ -162,7 +163,8 @@ def create_app(
     ) -> dict[str, Any]:
         app_services: AppServices = request.app.state.services
         try:
-            sql = app_services.vn.generate_sql(
+            sql = await run_in_threadpool(
+                app_services.vn.generate_sql,
                 question=body.question,
                 allow_llm_to_see_data=body.allow_llm_to_see_data,
             )
@@ -178,7 +180,11 @@ def create_app(
     async def run_sql_endpoint(request: Request, body: RunSqlRequest) -> dict[str, Any]:
         app_services: AppServices = request.app.state.services
         try:
-            result = app_services.db.execute_sql(body.sql, max_rows=body.max_rows)
+            result = await run_in_threadpool(
+                app_services.db.execute_sql,
+                body.sql,
+                body.max_rows,
+            )
             return result.to_dict()
         except (DatabaseConnectionError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -187,17 +193,23 @@ def create_app(
     async def ask_endpoint(request: Request, body: AskRequest) -> dict[str, Any]:
         app_services: AppServices = request.app.state.services
         try:
-            sql = app_services.vn.generate_sql(
+            sql = await run_in_threadpool(
+                app_services.vn.generate_sql,
                 question=body.question,
                 allow_llm_to_see_data=body.allow_llm_to_see_data,
             )
-            result = app_services.db.execute_sql(sql, max_rows=body.max_rows)
+            result = await run_in_threadpool(
+                app_services.db.execute_sql,
+                sql,
+                body.max_rows,
+            )
             training_saved = False
             if body.auto_train:
-                training_saved = add_question_sql_if_missing(
+                training_saved = await run_in_threadpool(
+                    add_question_sql_if_missing,
                     app_services.vn,
-                    question=body.question,
-                    sql=sql,
+                    body.question,
+                    sql,
                 )
             return {
                 "question": body.question,
