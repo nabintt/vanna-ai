@@ -125,6 +125,39 @@ def test_coerce_text_tool_calls_leaves_normal_text_alone():
     assert normalized.tool_calls is None
 
 
+def test_coerce_text_tool_calls_reuses_previous_sql_for_followup_run_request():
+    response = LlmResponse(
+        content="""
+```json
+{"name":"run the above query and give me the result","arguments":{}}
+```
+""",
+        tool_calls=None,
+    )
+    messages = [
+        LlmMessage(
+            role="assistant",
+            content="""
+Here is the SQL:
+
+```sql
+SELECT "id", "username"
+FROM "public"."player"
+LIMIT 10;
+```
+""",
+        ),
+        LlmMessage(role="user", content="run the above query and give me the result"),
+    ]
+
+    normalized = coerce_text_tool_calls(response, build_tool_schemas(), messages)
+
+    assert normalized.tool_calls is not None
+    assert normalized.tool_calls[0].name == "run_sql"
+    assert normalized.tool_calls[0].arguments["sql"].startswith('SELECT "id", "username"')
+    assert normalized.metadata["tool_call_fallback"] == "context_sql_reuse"
+
+
 def test_extract_text_tool_calls_from_sql_explanation_plus_trailing_json():
     content = """
 To get the top 10 players from the `leaderboard_past` table based on their skill, we need to join this table with the `top_skilled_player_games` table using the `player_id` column.

@@ -45,6 +45,7 @@ from app.db import DatabaseClient, DatabaseConnectionError
 logger = logging.getLogger(__name__)
 
 JSON_CODE_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+SQL_CODE_BLOCK_PATTERN = re.compile(r"```sql\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 SEARCH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 DDL_TABLE_PATTERN = re.compile(
     r"CREATE\s+TABLE\s+(?:\"|`)?(?P<schema>[A-Za-z0-9_]+)(?:\"|`)?\.(?:\"|`)?(?P<table>[A-Za-z0-9_]+)(?:\"|`)?",
@@ -62,6 +63,10 @@ MUTATING_SQL_PATTERN = re.compile(
 DDL_SKIP_TOKENS = {"create", "table", "primary", "constraint", "foreign", "unique", "check"}
 REQUEST_SCHEMA_CONTEXT_MARKER = "[Attached schema context for this request]"
 REQUEST_SQL_FEEDBACK_MARKER = "[Recent SQL execution feedback for this conversation]"
+FOLLOWUP_RUN_SQL_PATTERN = re.compile(
+    r"\b(run|execute|use|try)\b.*\b(query|sql|statement|above|previous|that|this|it)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -158,6 +163,8 @@ class SqlChatSystemPromptBuilder(SystemPromptBuilder):
                 "You are a careful SQL analyst assistant.",
                 "Use only the real schema context and the available SQL tool.",
                 "Call `run_sql` only when you still need information to answer the user.",
+                "When you make a tool call, the tool name must be exactly `run_sql` and the arguments must be `{\"sql\": \"...\"}`.",
+                "If the user asks to run the previous or above query, reuse the latest SQL you already produced instead of inventing a new tool name.",
                 "If the first successful SQL result already answers the question, stop calling tools and answer directly.",
                 "Do not repeat an equivalent successful query.",
                 "Do not return JSON unless you are making a tool call.",
@@ -286,7 +293,7 @@ class OllamaToolCallFallbackService(OllamaLlmService):
 
     async def send_request(self, request: LlmRequest) -> LlmResponse:
         response = await super().send_request(request)
-        return coerce_text_tool_calls(response, request.tools)
+        return coerce_text_tool_calls(response, request.tools, request.messages)
 
     async def stream_request(
         self,
@@ -313,7 +320,7 @@ class OllamaToolCallFallbackService(OllamaLlmService):
             finish_reason=finish_reason,
             metadata=metadata,
         )
-        normalized = coerce_text_tool_calls(response, request.tools)
+        normalized = coerce_text_tool_calls(response, request.tools, request.messages)
         yield LlmStreamChunk(
             content=normalized.content,
             tool_calls=normalized.tool_calls,
@@ -325,17 +332,28 @@ class OllamaToolCallFallbackService(OllamaLlmService):
 def coerce_text_tool_calls(
     response: LlmResponse,
     tools: list[ToolSchema] | None,
+    messages: list[LlmMessage] | None = None,
 ) -> LlmResponse:
     if response.tool_calls or not response.content or not tools:
         return response
 
     parsed_tool_calls = extract_text_tool_calls(response.content, tools)
+    inferred_from_context = False
+    if not parsed_tool_calls:
+        parsed_tool_calls = infer_run_sql_tool_call_from_context(
+            response.content,
+            tools,
+            messages or [],
+        )
+        inferred_from_context = bool(parsed_tool_calls)
     if not parsed_tool_calls:
         return response
 
     metadata = dict(response.metadata)
     metadata["tool_call_fallback"] = "text_json"
     metadata["tool_call_fallback_count"] = len(parsed_tool_calls)
+    if inferred_from_context:
+        metadata["tool_call_fallback"] = "context_sql_reuse"
 
     return LlmResponse(
         content=None,
@@ -396,6 +414,51 @@ def extract_text_tool_calls(
             )
 
     return tool_calls
+
+
+def infer_run_sql_tool_call_from_context(
+    response_content: str,
+    tools: list[ToolSchema] | None,
+    messages: list[LlmMessage],
+) -> list[ToolCall]:
+    allowed_tool_names = {tool.name for tool in tools or []}
+    if "run_sql" not in allowed_tool_names:
+        return []
+
+    last_user_message = next(
+        (message.content or "" for message in reversed(messages) if message.role == "user"),
+        "",
+    ).strip()
+    if not looks_like_followup_run_sql_request(last_user_message, response_content):
+        return []
+
+    sql = extract_latest_assistant_sql(messages)
+    if not sql:
+        return []
+
+    return [
+        ToolCall(
+            id="context-tool-call-1",
+            name="run_sql",
+            arguments={"sql": sql},
+        )
+    ]
+
+
+def looks_like_followup_run_sql_request(last_user_message: str, response_content: str) -> bool:
+    haystacks = [last_user_message, response_content]
+    return any(FOLLOWUP_RUN_SQL_PATTERN.search(haystack or "") for haystack in haystacks)
+
+
+def extract_latest_assistant_sql(messages: list[LlmMessage]) -> str | None:
+    for message in reversed(messages):
+        if message.role != "assistant" or not message.content:
+            continue
+        for match in reversed(list(SQL_CODE_BLOCK_PATTERN.finditer(message.content))):
+            sql = match.group(1).strip()
+            if is_read_only_sql(sql):
+                return sql
+    return None
 
 
 def decode_json_objects(candidate: str) -> list[dict[str, Any]]:
