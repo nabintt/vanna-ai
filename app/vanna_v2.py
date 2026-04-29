@@ -42,7 +42,7 @@ from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.config import Settings
-from app.db import DatabaseClient, DatabaseConnectionError
+from app.db import DatabaseClient, DatabaseConnectionError, build_ddl_statements
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,14 @@ class SuccessfulSqlResult:
     row_count: int
     columns: tuple[str, ...]
     rows: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class FullDatabaseSchema:
+    """Pre-built snapshot of the entire database schema for prompt injection."""
+    table_overview: str
+    all_ddls: list[str]
+    table_count: int
 
 
 class NoOpAgentMemory(AgentMemory):
@@ -707,10 +715,11 @@ def decode_json_objects(candidate: str) -> list[dict[str, Any]]:
 class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
     """Inject relevant DDL, docs, and examples into the SQL-generation prompt."""
 
-    def __init__(self, vn: Any, agent_memory: Any):
+    def __init__(self, vn: Any, agent_memory: Any, full_schema: FullDatabaseSchema | None = None):
         self.vn = vn
         self.base_enhancer = DefaultLlmContextEnhancer(agent_memory)
         self.schema_catalog = build_schema_catalog(vn)
+        self.full_schema = full_schema
 
     async def enhance_system_prompt(
         self,
@@ -723,6 +732,7 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             vn=self.vn,
             schema_catalog=self.schema_catalog,
             question=user_message,
+            full_schema=self.full_schema,
         )
 
         prompt_parts = [
@@ -738,9 +748,19 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             "- If the schema context is still insufficient, prefer a read-only metadata query against `information_schema` or relevant catalog views before guessing.",
         ]
 
+        # Always inject full schema overview so the model knows ALL tables and columns
+        if self.full_schema and self.full_schema.table_overview:
+            prompt_parts.extend([
+                "",
+                f"## Complete Database Schema ({self.full_schema.table_count} tables)",
+                "The database contains the following tables and their columns.",
+                "Use ONLY tables and columns listed here. Do not invent or guess names.",
+                self.full_schema.table_overview,
+            ])
+
         schema_section = format_schema_context(context_bundle["related_ddl"])
         if schema_section:
-            prompt_parts.extend(["", "## Relevant Schema", schema_section])
+            prompt_parts.extend(["", "## Detailed Schema for Relevant Tables", schema_section])
 
         documentation_section = format_documentation_context(context_bundle["related_docs"])
         if documentation_section:
@@ -777,6 +797,7 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             vn=self.vn,
             schema_catalog=self.schema_catalog,
             question=base_content,
+            full_schema=self.full_schema,
         )
         request_context = format_request_schema_context(
             context_bundle,
@@ -799,11 +820,16 @@ def build_schema_context_bundle(
     vn: Any,
     schema_catalog: list[SchemaCatalogEntry],
     question: str,
+    full_schema: FullDatabaseSchema | None = None,
 ) -> dict[str, Any]:
-    related_ddl = dedupe_text_items(safe_list(vn.get_related_ddl, question=question))
+    related_ddl = dedupe_text_items(safe_list(vn.get_related_ddl, question=question), limit=10)
     if len(related_ddl) < 3:
-        fallback_ddl = [entry.ddl for entry in search_schema_catalog(schema_catalog, question)]
-        related_ddl = dedupe_text_items([*related_ddl, *fallback_ddl])
+        fallback_ddl = [entry.ddl for entry in search_schema_catalog(schema_catalog, question, limit=8)]
+        related_ddl = dedupe_text_items([*related_ddl, *fallback_ddl], limit=10)
+
+    # If vector search and catalog search both failed, fall back to full schema DDLs
+    if len(related_ddl) < 2 and full_schema and full_schema.all_ddls:
+        related_ddl = dedupe_text_items([*related_ddl, *full_schema.all_ddls], limit=12)
 
     similar_pairs = filter_question_sql_pairs_for_context(
         safe_list(vn.get_similar_question_sql, question=question),
@@ -813,7 +839,7 @@ def build_schema_context_bundle(
 
     return {
         "related_ddl": related_ddl,
-        "related_docs": dedupe_text_items(safe_list(vn.get_related_documentation, question=question)),
+        "related_docs": dedupe_text_items(safe_list(vn.get_related_documentation, question=question), limit=8),
         "similar_pairs": similar_pairs,
     }
 
@@ -947,6 +973,37 @@ def build_schema_catalog(vn: Any) -> list[SchemaCatalogEntry]:
     return catalog
 
 
+def build_full_database_schema(db: DatabaseClient, db_type: str) -> FullDatabaseSchema:
+    """Fetch the complete schema from the live database and build a compact overview."""
+    try:
+        columns_df = db.fetch_information_schema_columns()
+        constraints_df = db.fetch_table_constraints()
+    except Exception:
+        logger.warning("Failed to fetch database schema for full overview", exc_info=True)
+        return FullDatabaseSchema(table_overview="", all_ddls=[], table_count=0)
+
+    if columns_df.empty:
+        return FullDatabaseSchema(table_overview="", all_ddls=[], table_count=0)
+
+    all_ddls = build_ddl_statements(db_type, columns_df, constraints_df)
+
+    lines: list[str] = []
+    grouped = columns_df.sort_values(
+        by=["table_schema", "table_name", "ordinal_position"],
+    ).groupby(["table_schema", "table_name"], sort=False)
+
+    for (schema, table), group in grouped:
+        columns = group["column_name"].astype(str).tolist()
+        lines.append(f"- {schema}.{table}: {', '.join(columns)}")
+
+    logger.info("Built full database schema overview: %d tables, %d DDLs", len(lines), len(all_ddls))
+    return FullDatabaseSchema(
+        table_overview="\n".join(lines),
+        all_ddls=all_ddls,
+        table_count=len(lines),
+    )
+
+
 def extract_table_name_from_ddl(ddl: str) -> str:
     match = DDL_TABLE_PATTERN.search(ddl)
     if not match:
@@ -1022,15 +1079,15 @@ def format_schema_context(related_ddl: list[str]) -> str:
         return ""
 
     lines: list[str] = []
-    for ddl in related_ddl[:4]:
+    for ddl in related_ddl[:10]:
         table_name = extract_table_name_from_ddl(ddl)
         columns = extract_column_names_from_ddl(ddl)
         if columns:
-            column_preview = ", ".join(columns[:12])
-            if len(columns) > 12:
+            column_preview = ", ".join(columns[:16])
+            if len(columns) > 16:
                 column_preview += ", ..."
             lines.append(f"- `{table_name}` columns: {column_preview}")
-        lines.append(f"```sql\n{truncate_text(ddl, 1600)}\n```")
+        lines.append(f"```sql\n{truncate_text(ddl, 2000)}\n```")
     return "\n".join(lines)
 
 
@@ -1221,7 +1278,9 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
         agent_memory=agent_memory,
         user_resolver=LocalAdminUserResolver(),
         system_prompt_builder=SqlChatSystemPromptBuilder(),
-        llm_context_enhancer=SchemaAwareLlmContextEnhancer(vn, None),
+        llm_context_enhancer=SchemaAwareLlmContextEnhancer(
+            vn, None, full_schema=build_full_database_schema(db, settings.normalized_db_type),
+        ),
         conversation_filters=[StandaloneQuestionConversationFilter()],
         config=AgentConfig(
             max_tool_iterations=settings.chat_max_tool_iterations,
