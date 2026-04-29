@@ -1294,6 +1294,8 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
 async def stream_with_keepalive(
     stream: AsyncGenerator[Any, None],
     keepalive_seconds: float,
+    *,
+    max_keepalives_after_first_chunk: int = 2,
 ) -> AsyncGenerator[Any | None, None]:
     if keepalive_seconds <= 0:
         async for item in stream:
@@ -1302,12 +1304,21 @@ async def stream_with_keepalive(
 
     stream_iter = stream.__aiter__()
     pending = asyncio.create_task(stream_iter.__anext__())
+    has_yielded_first_real_chunk = False
+    keepalives_sent_after_first_chunk = 0
 
     try:
         while True:
             done, _ = await asyncio.wait({pending}, timeout=keepalive_seconds)
             if pending not in done:
-                yield None
+                # After we've already started streaming real content,
+                # suppress repeated keepalives to avoid "looping" UI behavior
+                # for some clients/components.
+                if not has_yielded_first_real_chunk:
+                    yield None
+                elif keepalives_sent_after_first_chunk < max_keepalives_after_first_chunk:
+                    keepalives_sent_after_first_chunk += 1
+                    yield None
                 continue
 
             try:
@@ -1316,6 +1327,7 @@ async def stream_with_keepalive(
                 break
 
             yield item
+            has_yielded_first_real_chunk = True
             pending = asyncio.create_task(stream_iter.__anext__())
     finally:
         if not pending.done():
