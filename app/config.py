@@ -63,10 +63,6 @@ class Settings(BaseSettings):
     )
     max_result_rows: int = Field(default=200, validation_alias="MAX_RESULT_ROWS")
     vanna_top_k: int = Field(default=10, validation_alias="VANNA_TOP_K")
-    chat_max_tool_iterations: int = Field(
-        default=4,
-        validation_alias="CHAT_MAX_TOOL_ITERATIONS",
-    )
     sse_keepalive_seconds: float = Field(
         default=15.0,
         validation_alias="SSE_KEEPALIVE_SECONDS",

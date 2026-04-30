@@ -105,6 +105,8 @@ SSE_KEEPALIVE_SECONDS=15
 
 `DB_STATEMENT_TIMEOUT_MS=0` disables the Postgres statement timeout for this app session, and `SSE_KEEPALIVE_SECONDS` keeps the browser chat stream alive while a query is still running.
 
+The Vanna 2 chat path makes a single SQL tool call per request and does not auto-retry failed queries.
+
 ## Start Ollama
 
 Install Ollama for your platform, then pull at least the chat model:

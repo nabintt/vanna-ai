@@ -47,10 +47,6 @@ from app.db import DatabaseClient, DatabaseConnectionError, build_ddl_statements
 logger = logging.getLogger(__name__)
 
 JSON_CODE_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-SQL_CODE_BLOCK_PATTERN = re.compile(r"```sql\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-ROWS_JSON_BLOCK_PATTERN = re.compile(r"Rows:\s*```json\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-ROW_COUNT_PATTERN = re.compile(r"Returned\s+(\d+)\s+row\(s\)", re.IGNORECASE)
-NO_ROWS_PATTERN = re.compile(r"no rows were returned|no rows returned", re.IGNORECASE)
 SEARCH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 DDL_TABLE_PATTERN = re.compile(
     r"CREATE\s+TABLE\s+(?:\"|`)?(?P<schema>[A-Za-z0-9_]+)(?:\"|`)?\.(?:\"|`)?(?P<table>[A-Za-z0-9_]+)(?:\"|`)?",
@@ -67,7 +63,6 @@ MUTATING_SQL_PATTERN = re.compile(
 )
 DDL_SKIP_TOKENS = {"create", "table", "primary", "constraint", "foreign", "unique", "check"}
 REQUEST_SCHEMA_CONTEXT_MARKER = "[Attached schema context for this request]"
-REQUEST_SQL_FEEDBACK_MARKER = "[Recent SQL execution feedback for this conversation]"
 FOLLOWUP_RUN_SQL_PATTERN = re.compile(
     r"\b(run|execute|use|try)\b.*\b(query|sql|statement|above|previous|that|this|it)\b",
     re.IGNORECASE,
@@ -87,22 +82,6 @@ class SchemaCatalogEntry:
     columns: tuple[str, ...]
     ddl: str
     search_terms: frozenset[str]
-
-
-@dataclass(frozen=True)
-class RecentSqlAttempt:
-    sql: str
-    tables: tuple[str, ...]
-    outcome: str
-    detail: str
-
-
-@dataclass(frozen=True)
-class SuccessfulSqlResult:
-    sql: str
-    row_count: int
-    columns: tuple[str, ...]
-    rows: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True)
@@ -193,9 +172,8 @@ class SqlChatSystemPromptBuilder(SystemPromptBuilder):
                 "Treat each new standalone user question as a fresh request unless the user explicitly refers to a previous query, result, or instruction.",
                 "Call `run_sql` only when you still need information to answer the user.",
                 "When you make a tool call, the tool name must be exactly `run_sql` and the arguments must be `{\"sql\": \"...\"}`.",
-                "If the user asks to run the previous or above query, reuse the latest SQL you already produced instead of inventing a new tool name.",
+                "Make at most one SQL tool call per user request.",
                 "If the first successful SQL result already answers the question, stop calling tools and answer directly.",
-                "Do not repeat an equivalent successful query.",
                 "Do not return JSON unless you are making a tool call.",
                 "The user can already see the query result table, so your final answer should summarize only the answer, key figures, and caveats.",
                 f"Available tools: {tool_names}",
@@ -207,34 +185,6 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
     def __init__(self, db: DatabaseClient, max_rows: int):
         self.db = db
         self.max_rows = max_rows
-        self._successful_sql_by_conversation: dict[str, str] = {}
-
-    def _cache_key(self, context: ToolContext) -> str:
-        """
-        Use the most stable identifier available from ToolContext.
-        Some Vanna executions can change/omit `conversation_id` across tool iterations,
-        which prevents duplicate suppression unless we fall back to other ids.
-        """
-        # Prefer conversation id if present.
-        for attr in (
-            "conversation_id",
-            # Common fallback identifiers (may or may not exist on ToolContext).
-            "request_id",
-            "session_id",
-            "user_id",
-        ):
-            value = getattr(context, attr, None)
-            if value is None:
-                continue
-            if isinstance(value, str):
-                if value.strip():
-                    return value.strip()
-                continue
-            # For non-strings, still create a deterministic key.
-            return str(value)
-
-        # Last resort: suppress duplicates only when the tool context provides nothing stable.
-        return "unknown_context"
 
     @property
     def name(self) -> str:
@@ -248,32 +198,17 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
         return RunSqlToolArgs
 
     async def execute(self, context: ToolContext, args: RunSqlToolArgs) -> ToolResult:
+        del context
         sql = args.sql.strip()
         if not is_read_only_sql(sql):
             return build_sql_tool_error(
                 "Only single-statement read-only SQL is allowed here. Use SELECT, WITH, SHOW, DESCRIBE, or EXPLAIN."
             )
 
-        sql_fingerprint = normalize_sql_for_comparison(sql)
-        cache_key = self._cache_key(context)
-        previous_sql = self._successful_sql_by_conversation.get(cache_key)
-        if previous_sql == sql_fingerprint:
-            return ToolResult(
-                success=True,
-                result_for_llm=(
-                    "This exact SQL already executed successfully in this conversation. "
-                    "Do not run it again. Use the existing result and answer the user now."
-                ),
-                ui_component=None,
-                metadata={"duplicate_sql": True, "sql": sql},
-            )
-
         try:
             result = await run_in_threadpool(self.db.execute_sql, sql, self.max_rows)
         except (DatabaseConnectionError, ValueError) as exc:
             return build_sql_tool_error(str(exc))
-
-        self._successful_sql_by_conversation[cache_key] = sql_fingerprint
 
         description = (
             f"Returned {result.row_count} row(s)"
@@ -431,23 +366,14 @@ def coerce_text_tool_calls(
     tools: list[ToolSchema] | None,
     messages: list[LlmMessage] | None = None,
 ) -> LlmResponse:
+    del messages
     normalized = response
     if not normalized.tool_calls and normalized.content and tools:
         parsed_tool_calls = extract_text_tool_calls(normalized.content, tools)
-        inferred_from_context = False
-        if not parsed_tool_calls:
-            parsed_tool_calls = infer_run_sql_tool_call_from_context(
-                normalized.content,
-                tools,
-                messages or [],
-            )
-            inferred_from_context = bool(parsed_tool_calls)
         if parsed_tool_calls:
             metadata = dict(normalized.metadata)
             metadata["tool_call_fallback"] = "text_json"
             metadata["tool_call_fallback_count"] = len(parsed_tool_calls)
-            if inferred_from_context:
-                metadata["tool_call_fallback"] = "context_sql_reuse"
 
             normalized = LlmResponse(
                 content=None,
@@ -457,7 +383,7 @@ def coerce_text_tool_calls(
                 metadata=metadata,
             )
 
-    return suppress_duplicate_run_sql_tool_calls(normalized, messages or [])
+    return normalized
 
 
 def extract_text_tool_calls(
@@ -512,207 +438,13 @@ def extract_text_tool_calls(
     return tool_calls
 
 
-def infer_run_sql_tool_call_from_context(
-    response_content: str,
-    tools: list[ToolSchema] | None,
-    messages: list[LlmMessage],
-) -> list[ToolCall]:
-    allowed_tool_names = {tool.name for tool in tools or []}
-    if "run_sql" not in allowed_tool_names:
-        return []
-
-    last_user_message = next(
-        (message.content or "" for message in reversed(messages) if message.role == "user"),
-        "",
-    ).strip()
-    if not looks_like_followup_run_sql_request(last_user_message, response_content):
-        return []
-
-    sql = extract_latest_assistant_sql(messages)
-    if not sql:
-        return []
-
-    return [
-        ToolCall(
-            id="context-tool-call-1",
-            name="run_sql",
-            arguments={"sql": sql},
-        )
-    ]
-
-
-def suppress_duplicate_run_sql_tool_calls(
-    response: LlmResponse,
-    messages: list[LlmMessage],
-) -> LlmResponse:
-    if not response.tool_calls:
-        return response
-
-    last_success = extract_last_successful_run_sql_result(messages)
-    if last_success is None:
-        return response
-
-    filtered_tool_calls: list[ToolCall] = []
-    suppressed_duplicate = False
-    for tool_call in response.tool_calls:
-        if tool_call.name != "run_sql":
-            filtered_tool_calls.append(tool_call)
-            continue
-
-        sql = str(tool_call.arguments.get("sql", "")).strip()
-        if normalize_sql_for_comparison(sql) == normalize_sql_for_comparison(last_success.sql):
-            suppressed_duplicate = True
-            continue
-
-        filtered_tool_calls.append(tool_call)
-
-    if filtered_tool_calls:
-        if not suppressed_duplicate:
-            return response
-        metadata = dict(response.metadata)
-        metadata["suppressed_duplicate_tool_call"] = True
-        return LlmResponse(
-            content=response.content,
-            tool_calls=filtered_tool_calls,
-            finish_reason=response.finish_reason,
-            usage=response.usage,
-            metadata=metadata,
-        )
-
-    if not suppressed_duplicate:
-        return response
-
-    metadata = dict(response.metadata)
-    metadata["suppressed_duplicate_tool_call"] = True
-    return LlmResponse(
-        content=build_duplicate_sql_answer(last_success),
-        tool_calls=None,
-        finish_reason="stop",
-        usage=response.usage,
-        metadata=metadata,
-    )
-
-
-def looks_like_followup_run_sql_request(last_user_message: str, response_content: str) -> bool:
-    haystacks = [last_user_message, response_content]
-    return any(FOLLOWUP_RUN_SQL_PATTERN.search(haystack or "") for haystack in haystacks)
-
-
 def is_context_dependent_followup_request(message: str) -> bool:
     normalized = normalize_whitespace(message).lower()
     if not normalized:
         return False
-    if looks_like_followup_run_sql_request(normalized, normalized):
+    if FOLLOWUP_RUN_SQL_PATTERN.search(normalized):
         return True
     return bool(CONTEXT_DEPENDENT_FOLLOWUP_PATTERN.search(normalized))
-
-
-def normalize_sql_for_comparison(sql: str) -> str:
-    normalized = normalize_whitespace(sql).rstrip(";")
-    return normalized.lower()
-
-
-def extract_latest_assistant_sql(messages: list[LlmMessage]) -> str | None:
-    for message in reversed(messages):
-        if message.role != "assistant" or not message.content:
-            continue
-        for match in reversed(list(SQL_CODE_BLOCK_PATTERN.finditer(message.content))):
-            sql = match.group(1).strip()
-            if is_read_only_sql(sql):
-                return sql
-    return None
-
-
-def extract_last_successful_run_sql_result(messages: list[LlmMessage]) -> SuccessfulSqlResult | None:
-    tool_calls_by_id: dict[str, str] = {}
-    for message in messages:
-        if message.role != "assistant" or not message.tool_calls:
-            continue
-        for tool_call in message.tool_calls:
-            if tool_call.name != "run_sql" or not tool_call.id:
-                continue
-            sql = str(tool_call.arguments.get("sql", "")).strip()
-            if sql:
-                tool_calls_by_id[tool_call.id] = sql
-
-    for message in reversed(messages):
-        if message.role != "tool" or not message.tool_call_id:
-            continue
-        sql = tool_calls_by_id.get(message.tool_call_id)
-        if not sql:
-            continue
-        if not is_successful_run_sql_content(message.content or ""):
-            continue
-
-        content = message.content or ""
-        return SuccessfulSqlResult(
-            sql=sql,
-            row_count=extract_row_count_from_tool_content(content),
-            columns=tuple(extract_columns_from_tool_content(content)),
-            rows=tuple(extract_rows_from_tool_content(content)),
-        )
-
-    return None
-
-
-def is_successful_run_sql_content(content: str) -> bool:
-    normalized = normalize_whitespace(content).lower()
-    return "sql executed successfully." in normalized or "query executed successfully." in normalized
-
-
-def extract_row_count_from_tool_content(content: str) -> int:
-    match = ROW_COUNT_PATTERN.search(content)
-    if match:
-        return int(match.group(1))
-    if NO_ROWS_PATTERN.search(content):
-        return 0
-    return 0
-
-
-def extract_columns_from_tool_content(content: str) -> list[str]:
-    for line in content.splitlines():
-        if not line.lower().startswith("columns:"):
-            continue
-        raw_columns = line.split(":", 1)[1]
-        return [column.strip() for column in raw_columns.split(",") if column.strip()]
-    return []
-
-
-def extract_rows_from_tool_content(content: str) -> list[dict[str, Any]]:
-    match = ROWS_JSON_BLOCK_PATTERN.search(content)
-    if not match:
-        return []
-
-    try:
-        payload = json.loads(match.group(1).strip())
-    except JSONDecodeError:
-        return []
-
-    if not isinstance(payload, list):
-        return []
-    return [row for row in payload if isinstance(row, dict)]
-
-
-def build_duplicate_sql_answer(result: SuccessfulSqlResult) -> str:
-    if result.row_count == 0:
-        return "I already ran that exact SQL and it returned no rows, so I won't rerun it."
-
-    if result.rows:
-        first_row = result.rows[0]
-        row_summary = ", ".join(f"`{key}` = {value}" for key, value in first_row.items())
-        return (
-            "I already ran that exact SQL successfully, so I won't rerun it. "
-            f"The result is: {row_summary}."
-        )
-
-    if result.columns:
-        columns_summary = ", ".join(f"`{column}`" for column in result.columns)
-        return (
-            "I already ran that exact SQL successfully, so I won't rerun it. "
-            f"The result shown above contains {result.row_count} row(s) with columns {columns_summary}."
-        )
-
-    return "I already ran that exact SQL successfully, so I won't rerun it."
 
 
 def decode_json_objects(candidate: str) -> list[dict[str, Any]]:
@@ -769,11 +501,9 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             "## SQL Generation Rules",
             "- Use only tables and columns that appear in the schema context or successful SQL examples below.",
             "- Do not invent columns such as `username`, `name`, or `skill` unless they are explicitly present in the provided schema.",
-            "- If a SQL execution error mentions a missing table or column, treat it as a schema mismatch and correct the query before drawing conclusions.",
-            "- Never conclude that a table is empty just because a previous SQL statement failed.",
-            "- Treat recent SQL errors and empty-result attempts as negative evidence. Do not repeat the same query path unchanged.",
-            "- If a successful SQL result already answers the question, stop and respond instead of running another query.",
-            "- If the schema context is still insufficient, prefer a read-only metadata query against `information_schema` or relevant catalog views before guessing.",
+            "- Make at most one SQL tool call for each user request.",
+            "- If one SQL result answers the question, stop and respond directly.",
+            "- If the schema context is insufficient, use a single read-only metadata query against `information_schema` instead of guessing.",
         ]
 
         # Always inject full schema overview so the model knows ALL tables and columns
@@ -827,10 +557,7 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             question=base_content,
             full_schema=self.full_schema,
         )
-        request_context = format_request_schema_context(
-            context_bundle,
-            collect_recent_run_sql_attempts(messages),
-        )
+        request_context = format_request_schema_context(context_bundle)
         if not request_context:
             return messages
 
@@ -1138,12 +865,10 @@ def format_question_sql_examples(pairs: list[dict[str, str]]) -> str:
 
 def format_request_schema_context(
     context_bundle: dict[str, Any],
-    recent_sql_attempts: list[RecentSqlAttempt] | None = None,
 ) -> str:
     related_ddl = context_bundle.get("related_ddl", [])
     related_docs = context_bundle.get("related_docs", [])
     similar_pairs = context_bundle.get("similar_pairs", [])
-    recent_sql_attempts = recent_sql_attempts or []
 
     parts = [REQUEST_SCHEMA_CONTEXT_MARKER]
 
@@ -1165,70 +890,10 @@ def format_request_schema_context(
     if examples_section:
         parts.extend(["## Similar SQL Examples", examples_section])
 
-    feedback_section = format_recent_sql_feedback(recent_sql_attempts)
-    if feedback_section:
-        parts.extend(["## Recent SQL Feedback", feedback_section])
-
     if len(parts) == 1:
         return ""
 
     return "\n".join(parts)
-
-
-def collect_recent_run_sql_attempts(messages: list[LlmMessage], limit: int = 4) -> list[RecentSqlAttempt]:
-    tool_calls_by_id: dict[str, str] = {}
-    attempts: list[RecentSqlAttempt] = []
-    seen: set[tuple[str, str]] = set()
-
-    for message in messages:
-        if message.role == "assistant" and message.tool_calls:
-            for tool_call in message.tool_calls:
-                if tool_call.name != "run_sql" or not tool_call.id:
-                    continue
-                sql = str(tool_call.arguments.get("sql", "")).strip()
-                if sql:
-                    tool_calls_by_id[tool_call.id] = sql
-
-    for message in messages:
-        if message.role != "tool" or not message.tool_call_id:
-            continue
-        sql = tool_calls_by_id.get(message.tool_call_id)
-        if not sql:
-            continue
-
-        outcome = classify_run_sql_outcome(message.content)
-        if outcome is None:
-            continue
-
-        detail = normalize_whitespace(message.content or "")
-        fingerprint = (normalize_whitespace(sql), outcome)
-        if fingerprint in seen:
-            continue
-        seen.add(fingerprint)
-
-        attempts.append(
-            RecentSqlAttempt(
-                sql=sql,
-                tables=tuple(extract_table_names_from_sql(sql)),
-                outcome=outcome,
-                detail=detail,
-            )
-        )
-
-    return attempts[-limit:]
-
-
-def classify_run_sql_outcome(content: str) -> str | None:
-    normalized = " ".join((content or "").strip().lower().split())
-    if not normalized:
-        return None
-    if "no rows returned" in normalized or "0 rows" in normalized:
-        return "empty"
-    if "sql executed successfully." in normalized or "query executed successfully." in normalized:
-        return None
-    if "results saved to file:" in normalized or "rows affected" in normalized:
-        return None
-    return "error"
 
 
 def extract_table_names_from_sql(sql: str) -> list[str]:
@@ -1246,25 +911,6 @@ def extract_table_names_from_sql(sql: str) -> list[str]:
         seen.add(normalized)
         table_names.append(normalized)
     return table_names
-
-
-def format_recent_sql_feedback(attempts: list[RecentSqlAttempt]) -> str:
-    if not attempts:
-        return ""
-
-    lines = [REQUEST_SQL_FEEDBACK_MARKER]
-    for attempt in attempts:
-        tables_display = ", ".join(f"`{table}`" for table in attempt.tables) if attempt.tables else "unknown tables"
-        sql_preview = truncate_text(attempt.sql, 320)
-        if attempt.outcome == "empty":
-            lines.append(
-                f"- Empty result for SQL on {tables_display}: `{sql_preview}`. This only means that exact query returned no rows. Do not repeat the same join/filter unchanged, and do not assume those tables are empty."
-            )
-        else:
-            lines.append(
-                f"- Failed SQL on {tables_display}: `{sql_preview}`. Error: {truncate_text(attempt.detail, 220)}. Do not retry the same broken columns/tables unchanged."
-            )
-    return "\n".join(lines)
 
 
 class LocalAdminUserResolver(UserResolver):
@@ -1311,7 +957,7 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
         ),
         conversation_filters=[StandaloneQuestionConversationFilter()],
         config=AgentConfig(
-            max_tool_iterations=settings.chat_max_tool_iterations,
+            max_tool_iterations=1,
             stream_responses=True,
             include_thinking_indicators=False,
         ),

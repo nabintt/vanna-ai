@@ -4,17 +4,13 @@ import asyncio
 import pandas as pd
 from vanna.core.llm import LlmMessage, LlmResponse
 from vanna.core.storage import Message
-from vanna.core.tool import ToolCall
 from vanna.core.tool import ToolContext
 from vanna.core.tool import ToolSchema
 from vanna.core.user import User
 
 from app.vanna_v2 import (
     REQUEST_SCHEMA_CONTEXT_MARKER,
-    REQUEST_SQL_FEEDBACK_MARKER,
-    build_duplicate_sql_answer,
     coerce_text_tool_calls,
-    extract_last_successful_run_sql_result,
     filter_question_sql_pairs_for_context,
     is_context_dependent_followup_request,
     NoOpAgentMemory,
@@ -134,7 +130,7 @@ def test_coerce_text_tool_calls_leaves_normal_text_alone():
     assert normalized.tool_calls is None
 
 
-def test_coerce_text_tool_calls_reuses_previous_sql_for_followup_run_request():
+def test_coerce_text_tool_calls_does_not_infer_previous_sql_for_followup_run_request():
     response = LlmResponse(
         content="""
 ```json
@@ -161,52 +157,8 @@ LIMIT 10;
 
     normalized = coerce_text_tool_calls(response, build_tool_schemas(), messages)
 
-    assert normalized.tool_calls is not None
-    assert normalized.tool_calls[0].name == "run_sql"
-    assert normalized.tool_calls[0].arguments["sql"].startswith('SELECT "id", "username"')
-    assert normalized.metadata["tool_call_fallback"] == "context_sql_reuse"
-
-
-def test_coerce_text_tool_calls_suppresses_duplicate_successful_run_sql():
-    response = LlmResponse(
-        content=None,
-        tool_calls=[
-            ToolCall(
-                id="tc-next",
-                name="run_sql",
-                arguments={"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'},
-            )
-        ],
-    )
-    messages = [
-        LlmMessage(
-            role="assistant",
-            content="",
-            tool_calls=[
-                ToolCall(
-                    id="tc-prev",
-                    name="run_sql",
-                    arguments={"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'},
-                )
-            ],
-        ),
-        LlmMessage(
-            role="tool",
-            content=(
-                "SQL executed successfully. Use this result to answer the user's question.\n"
-                "Returned 1 row(s). Duration: 12.5 ms.\n"
-                "Columns: item_id, uses\n"
-                "Rows:\n```json\n[{\"item_id\": 2, \"uses\": 2647107}]\n```"
-            ),
-            tool_call_id="tc-prev",
-        ),
-    ]
-
-    normalized = coerce_text_tool_calls(response, build_tool_schemas(), messages)
-
     assert normalized.tool_calls is None
-    assert "item_id" in (normalized.content or "")
-    assert normalized.metadata["suppressed_duplicate_tool_call"] is True
+    assert normalized.content is not None
 
 
 def test_extract_text_tool_calls_from_sql_explanation_plus_trailing_json():
@@ -231,40 +183,6 @@ Let's execute this query.
     assert len(tool_calls) == 1
     assert tool_calls[0].name == "run_sql"
     assert "ORDER BY t1.skill DESC" in tool_calls[0].arguments["sql"]
-
-
-def test_extract_last_successful_run_sql_result_parses_rows():
-    messages = [
-        LlmMessage(
-            role="assistant",
-            content="",
-            tool_calls=[
-                ToolCall(
-                    id="tc1",
-                    name="run_sql",
-                    arguments={"sql": 'SELECT "item_id", "uses" FROM "public"."inventory_usage" LIMIT 1;'},
-                )
-            ],
-        ),
-        LlmMessage(
-            role="tool",
-            content=(
-                "SQL executed successfully. Use this result to answer the user's question.\n"
-                "Returned 1 row(s). Duration: 12.5 ms.\n"
-                "Columns: item_id, uses\n"
-                "Rows:\n```json\n[{\"item_id\": 2, \"uses\": 2647107}]\n```"
-            ),
-            tool_call_id="tc1",
-        ),
-    ]
-
-    result = extract_last_successful_run_sql_result(messages)
-
-    assert result is not None
-    assert result.row_count == 1
-    assert result.columns == ("item_id", "uses")
-    assert result.rows[0]["item_id"] == 2
-    assert "2647107" in build_duplicate_sql_answer(result)
 
 
 class FakeSchemaAwareVanna:
@@ -374,55 +292,6 @@ def test_schema_aware_enhancer_appends_schema_to_user_message():
     assert "Use the following real database schema while answering this request." in enhanced_messages[-1].content
 
 
-def test_schema_aware_enhancer_appends_recent_sql_feedback():
-    vn = FakeSchemaAwareVanna()
-    enhancer = SchemaAwareLlmContextEnhancer(vn, agent_memory=None)
-    user = User(
-        id="u1",
-        username="analyst",
-        email="analyst@example.com",
-        group_memberships=["user"],
-    )
-
-    messages = [
-        LlmMessage(role="user", content="show top players"),
-        LlmMessage(
-            role="assistant",
-            content="",
-            tool_calls=[
-                ToolCall(
-                    id="tc1",
-                    name="run_sql",
-                    arguments={
-                        "sql": "SELECT t2.username, t1.skill FROM leaderboard_past AS t1 JOIN top_skilled_player_games AS t2 ON t1.player_id = t2.player_id ORDER BY t1.skill DESC LIMIT 10;"
-                    },
-                ),
-                ToolCall(
-                    id="tc2",
-                    name="run_sql",
-                    arguments={"sql": "SELECT * FROM leaderboard_past LIMIT 10;"},
-                ),
-            ],
-        ),
-        LlmMessage(role="tool", content='column "username" does not exist', tool_call_id="tc1"),
-        LlmMessage(
-            role="tool",
-            content="Query executed successfully. No rows returned.",
-            tool_call_id="tc2",
-        ),
-        LlmMessage(role="user", content="try a better query"),
-    ]
-
-    enhanced_messages = asyncio.run(enhancer.enhance_user_messages(messages, user))
-    final_content = enhanced_messages[-1].content or ""
-
-    assert REQUEST_SQL_FEEDBACK_MARKER in final_content
-    assert "Do not retry the same broken columns/tables unchanged." in final_content
-    assert "Do not repeat the same join/filter unchanged" in final_content
-    assert "`leaderboard_past`" in final_content
-    assert "`top_skilled_player_games`" in final_content
-
-
 def test_sql_chat_system_prompt_builder_prefers_single_successful_query():
     prompt = asyncio.run(
         SqlChatSystemPromptBuilder().build_system_prompt(
@@ -437,7 +306,7 @@ def test_sql_chat_system_prompt_builder_prefers_single_successful_query():
     )
 
     assert "stop calling tools and answer directly" in prompt
-    assert "Do not repeat an equivalent successful query." in prompt
+    assert "Make at most one SQL tool call per user request." in prompt
     assert "save_question_tool_args" not in prompt
 
 
@@ -514,7 +383,7 @@ def test_is_context_dependent_followup_request_detects_followup_language():
     )
 
 
-def test_read_only_sql_tool_skips_duplicate_successful_query_execution():
+def test_read_only_sql_tool_executes_query_each_time():
     class FakeDb:
         def __init__(self):
             self.calls: list[tuple[str, int]] = []
@@ -560,8 +429,7 @@ def test_read_only_sql_tool_skips_duplicate_successful_query_execution():
 
     first_result, second_result = asyncio.run(run_twice())
 
-    assert len(fake_db.calls) == 1
+    assert len(fake_db.calls) == 2
     assert first_result.success is True
     assert second_result.success is True
-    assert second_result.ui_component is None
-    assert second_result.metadata["duplicate_sql"] is True
+    assert first_result.metadata["sql"] == second_result.metadata["sql"]
