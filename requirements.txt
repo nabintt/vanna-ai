@@ -1,4 +1,5 @@
-vanna[fastapi,chromadb,ollama,postgres,mysql]==2.0.2
+vanna[fastapi,chromadb,postgres,mysql]==2.0.2
+zhipuai>=2.1.0
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 pydantic-settings==2.8.1

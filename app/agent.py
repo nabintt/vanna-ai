@@ -3,141 +3,58 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import httpx
 from vanna.legacy.chromadb import ChromaDB_VectorStore
-from vanna.legacy.ollama import Ollama
+from vanna.legacy.ZhipuAI import ZhipuAI_Chat, ZhipuAIEmbeddingFunction
 
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
 
-class OllamaNotReadyError(RuntimeError):
-    """Raised when the local Ollama runtime is unavailable or missing models."""
+class GLMNotReadyError(RuntimeError):
+    """Raised when the GLM API key is not configured or invalid."""
 
 
-class OllamaEmbeddingFunction:
-    def __init__(self, host: str, model: str, timeout: float):
-        self.host = host.rstrip("/")
-        self.model = model
-        self.timeout = timeout
+def inspect_glm(settings: Settings) -> dict[str, Any]:
+    api_key = settings.glm_api_key.strip() if settings.glm_api_key else ""
+    model = settings.normalized_glm_model
 
-    def __call__(self, input: list[str]) -> list[list[float]]:
-        response = httpx.post(
-            f"{self.host}/api/embed",
-            json={"model": self.model, "input": input},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        embeddings = payload.get("embeddings")
-        if not embeddings:
-            raise OllamaNotReadyError(
-                f"Ollama did not return embeddings for model '{self.model}'."
-            )
-        return embeddings
-
-
-def _collect_model_names(models: list[dict[str, Any]]) -> set[str]:
-    names: set[str] = set()
-    for model_info in models:
-        for key in ("name", "model"):
-            value = model_info.get(key)
-            if not value:
-                continue
-            names.add(value)
-            if value.endswith(":latest"):
-                names.add(value[: -len(":latest")])
-    return names
-
-
-def inspect_ollama(settings: Settings) -> dict[str, Any]:
-    requested_models = [settings.normalized_ollama_model]
-    if settings.normalized_ollama_embed_model:
-        requested_models.append(settings.normalized_ollama_embed_model)
-
-    try:
-        response = httpx.get(
-            f"{settings.ollama_host.rstrip('/')}/api/tags",
-            timeout=settings.ollama_timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except httpx.HTTPError as exc:
+    if not api_key:
         return {
             "ready": False,
-            "reachable": False,
-            "configured_host": settings.ollama_host,
-            "requested_models": requested_models,
-            "installed_models": [],
-            "missing_models": requested_models,
-            "error": f"Unable to reach Ollama at {settings.ollama_host}: {exc}",
+            "configured": False,
+            "configured_model": model,
+            "error": "GLM_API_KEY is not set. Please set it in your .env file.",
         }
 
-    installed_models = payload.get("models", [])
-    installed_names = sorted(_collect_model_names(installed_models))
-    missing_models = [model for model in requested_models if model not in installed_names]
     return {
-        "ready": not missing_models,
-        "reachable": True,
-        "configured_host": settings.ollama_host,
-        "requested_models": requested_models,
-        "installed_models": installed_names,
-        "missing_models": missing_models,
+        "ready": True,
+        "configured": True,
+        "configured_model": model,
+        "api_url": settings.glm_api_url or "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         "error": None,
     }
 
 
-def ensure_ollama_ready(settings: Settings) -> dict[str, Any]:
-    diagnostics = inspect_ollama(settings)
-    if diagnostics["reachable"] is False:
-        raise OllamaNotReadyError(diagnostics["error"])
-    if diagnostics["missing_models"]:
-        pull_instructions = ", ".join(
-            f"ollama pull {model.removesuffix(':latest')}"
-            for model in diagnostics["missing_models"]
-        )
-        raise OllamaNotReadyError(
-            "Missing required Ollama model(s): "
-            + ", ".join(diagnostics["missing_models"])
-            + f". Install them with: {pull_instructions}"
-        )
+def ensure_glm_ready(settings: Settings) -> dict[str, Any]:
+    diagnostics = inspect_glm(settings)
+    if not diagnostics["ready"]:
+        raise GLMNotReadyError(diagnostics["error"])
     return diagnostics
 
 
-class FailFastOllama(Ollama):
-    @staticmethod
-    def _Ollama__pull_model_if_ne(ollama_client: Any, model: str) -> None:
-        model_response = ollama_client.list()
-        # Handle both dict (older client) and object (newer client) responses.
-        if isinstance(model_response, dict):
-            models_list = model_response.get("models", [])
-        else:
-            models_list = getattr(model_response, "models", []) or []
-            models_list = [m.__dict__ if hasattr(m, "__dict__") else m for m in models_list]
-        installed_names = _collect_model_names(models_list)
-        short_model = model.removesuffix(":latest")
-        if model not in installed_names and short_model not in installed_names:
-            raise OllamaNotReadyError(
-                f"Ollama model '{model}' is not installed. Run: ollama pull {short_model}"
-            )
-
-
-class LocalChromaOllamaVanna(ChromaDB_VectorStore, FailFastOllama):
+class LocalChromaGLMVanna(ChromaDB_VectorStore, ZhipuAI_Chat):
     def __init__(self, config: dict[str, Any]):
         ChromaDB_VectorStore.__init__(self, config=config)
-        FailFastOllama.__init__(self, config=config)
+        ZhipuAI_Chat.__init__(self, config=config)
 
 
-def create_vanna_agent(settings: Settings) -> LocalChromaOllamaVanna:
-    ensure_ollama_ready(settings)
+def create_vanna_agent(settings: Settings) -> LocalChromaGLMVanna:
+    ensure_glm_ready(settings)
 
     config: dict[str, Any] = {
-        "model": settings.normalized_ollama_model,
-        "ollama_host": settings.ollama_host,
-        "ollama_timeout": settings.ollama_timeout,
-        "keep_alive": settings.ollama_keep_alive,
-        "options": {"num_ctx": settings.ollama_num_ctx},
+        "api_key": settings.glm_api_key,
+        "model": settings.normalized_glm_model,
         "path": str(settings.chroma_path),
         "n_results": settings.vanna_top_k,
         "initial_prompt": (
@@ -146,18 +63,20 @@ def create_vanna_agent(settings: Settings) -> LocalChromaOllamaVanna:
         ),
     }
 
-    if settings.normalized_ollama_embed_model:
-        config["embedding_function"] = OllamaEmbeddingFunction(
-            host=settings.ollama_host,
-            model=settings.normalized_ollama_embed_model,
-            timeout=settings.ollama_timeout,
-        )
+    if settings.glm_api_url:
+        config["api_url"] = settings.glm_api_url
+
+    # Use ZhipuAI embedding function
+    config["embedding_function"] = ZhipuAIEmbeddingFunction(
+        config={"api_key": settings.glm_api_key, "model_name": settings.normalized_glm_embed_model}
+    )
 
     logger.info("Creating Vanna agent with local Chroma persistence at %s", settings.chroma_path)
-    return LocalChromaOllamaVanna(config=config)
+    logger.info("Using GLM model: %s", settings.normalized_glm_model)
+    return LocalChromaGLMVanna(config=config)
 
 
-def connect_vanna_to_database(vn: LocalChromaOllamaVanna, settings: Settings) -> None:
+def connect_vanna_to_database(vn: LocalChromaGLMVanna, settings: Settings) -> None:
     if settings.normalized_db_type == "postgres":
         vn.connect_to_postgres(
             host=settings.db_host,

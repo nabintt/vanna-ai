@@ -1,9 +1,9 @@
-# Local Vanna AI with Ollama
+# Local Vanna AI with GLM
 
 This repo runs a local Vanna stack on top of:
 
 - `vanna==2.0.2`
-- Ollama for SQL generation
+- ZhipuAI GLM API for SQL generation
 - Chroma for persisted training vectors
 - FastAPI for both the API and the Vanna 2 chat UI
 - PostgreSQL first, with MySQL-ready database wiring
@@ -16,6 +16,7 @@ The important design choice is that this project uses the new Vanna 2 chat/serve
 - `GET /` serves the Vanna 2 chat UI.
 - `GET /docs` serves FastAPI Swagger docs for the repo's API endpoints.
 - Existing training data in `data/chroma/` is still used when present, but automatic training is off by default.
+- Uses ZhipuAI GLM API instead of local Ollama for SQL generation.
 
 There is no separate Flask UI server anymore.
 
@@ -40,7 +41,7 @@ There is no separate Flask UI server anymore.
 │   └── vanna_v2.py
 ├── scripts
 │   ├── bootstrap_training.py
-│   ├── check_ollama.py
+│   ├── check_glm.py
 │   └── run_server.py
 ├── data
 │   ├── chroma
@@ -76,8 +77,8 @@ cp .env.example .env
 Minimum required settings:
 
 ```dotenv
-OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=llama3.2
+GLM_API_KEY=your-glm-api-key-here
+GLM_MODEL=glm-4
 DB_TYPE=postgres
 DB_HOST=localhost
 DB_PORT=5432
@@ -107,30 +108,24 @@ SSE_KEEPALIVE_SECONDS=15
 
 The Vanna 2 chat path makes a single SQL tool call per request and does not auto-retry failed queries.
 
-## Start Ollama
+## Get GLM API Key
 
-Install Ollama for your platform, then pull at least the chat model:
+You need a ZhipuAI API key to use GLM models:
 
-```bash
-ollama pull llama3.2
-```
+1. Visit [ZhipuAI Platform](https://open.bigmodel.cn/)
+2. Sign up and get your API key
+3. Set `GLM_API_KEY` in your `.env` file
 
-Optional local embeddings:
+Available GLM models:
+- `glm-4` - Default model
+- `glm-4-flash` - Faster responses
+- `glm-4-plus` - More capable
+- `glm-3-turbo` - Cost-effective option
 
-```bash
-ollama pull embeddinggemma
-```
-
-Then set:
-
-```dotenv
-OLLAMA_EMBED_MODEL=embeddinggemma
-```
-
-Verify Ollama:
+## Verify GLM configuration
 
 ```bash
-make check-ollama
+make check-glm
 ```
 
 ## Bootstrap training
@@ -240,7 +235,7 @@ curl -X POST http://localhost:8000/run_sql \
 
 ```bash
 make setup
-make check-ollama
+make check-glm
 make train
 make run
 make test
@@ -249,7 +244,7 @@ make test
 ## Architecture notes
 
 - `app/config.py`: environment-driven settings
-- `app/agent.py`: local Ollama checks and legacy Vanna agent creation
+- `app/agent.py`: GLM/ZhipuAI Vanna agent creation
 - `app/training.py`: idempotent schema/docs/example bootstrap into Chroma
 - `app/vanna_v2.py`: Vanna 2 chat handler and UI routes
 - `app/server.py`: FastAPI lifecycle plus repo API endpoints
@@ -257,10 +252,10 @@ make test
 ## First run checklist
 
 1. Create the virtualenv and install dependencies.
-2. Start Ollama and pull `llama3.2`.
-3. Copy `.env.example` to `.env` and fill in your DB credentials.
+2. Get your GLM API key from ZhipuAI platform.
+3. Copy `.env.example` to `.env` and fill in your GLM API key and DB credentials.
 4. Make sure your database is reachable.
-5. Run `make check-ollama`.
+5. Run `make check-glm`.
 6. Run `make train` only if you want to refresh the local Chroma training data.
 7. Run `make run`.
 8. Open `http://localhost:8000/`.

@@ -34,12 +34,12 @@ class Settings(BaseSettings):
         validation_alias="VANNA_UI_CDN_URL",
     )
 
-    ollama_host: str = Field(default="http://localhost:11434", validation_alias="OLLAMA_HOST")
-    ollama_model: str = Field(default="llama3.2", validation_alias="OLLAMA_MODEL")
-    ollama_embed_model: str | None = Field(default=None, validation_alias="OLLAMA_EMBED_MODEL")
-    ollama_timeout: float = Field(default=120.0, validation_alias="OLLAMA_TIMEOUT")
-    ollama_keep_alive: str | None = Field(default="15m", validation_alias="OLLAMA_KEEP_ALIVE")
-    ollama_num_ctx: int = Field(default=4096, validation_alias="OLLAMA_NUM_CTX")
+    # GLM / ZhipuAI settings
+    glm_api_key: str = Field(default="", validation_alias="GLM_API_KEY")
+    glm_model: str = Field(default="glm-4", validation_alias="GLM_MODEL")
+    glm_api_url: str | None = Field(default=None, validation_alias="GLM_API_URL")
+    glm_embed_model: str = Field(default="embedding-2", validation_alias="GLM_EMBED_MODEL")
+    glm_timeout: float = Field(default=120.0, validation_alias="GLM_TIMEOUT")
 
     db_type: str = Field(default="postgres", validation_alias="DB_TYPE")
     db_host: str = Field(default="localhost", validation_alias="DB_HOST")
@@ -87,14 +87,12 @@ class Settings(BaseSettings):
     )
 
     @property
-    def normalized_ollama_model(self) -> str:
-        return normalize_ollama_model_name(self.ollama_model)
+    def normalized_glm_model(self) -> str:
+        return self.glm_model.strip()
 
     @property
-    def normalized_ollama_embed_model(self) -> str | None:
-        if not self.ollama_embed_model:
-            return None
-        return normalize_ollama_model_name(self.ollama_embed_model)
+    def normalized_glm_embed_model(self) -> str:
+        return self.glm_embed_model.strip()
 
     @property
     def normalized_db_type(self) -> str:
@@ -144,15 +142,6 @@ class Settings(BaseSettings):
                 + ", ".join(missing)
                 + ". Update your .env file before starting the server."
             )
-
-
-def normalize_ollama_model_name(model_name: str) -> str:
-    model_name = model_name.strip()
-    if not model_name:
-        raise ValueError("OLLAMA_MODEL cannot be empty.")
-    if ":" not in model_name:
-        return f"{model_name}:latest"
-    return model_name
 
 
 @lru_cache(maxsize=1)

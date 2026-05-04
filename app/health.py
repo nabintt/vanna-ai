@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from app.agent import inspect_ollama
+from app.agent import inspect_glm
 from app.config import Settings
 from app.db import DatabaseClient, DatabaseConnectionError
 from app.training import summarize_training
@@ -20,7 +20,7 @@ def build_health_payload(started_at: datetime) -> dict[str, Any]:
 
 
 def build_ready_payload(settings: Settings, db: DatabaseClient, vn: Any) -> tuple[bool, dict[str, Any]]:
-    ollama_status = inspect_ollama(settings)
+    glm_status = inspect_glm(settings)
 
     try:
         db.test_connection()
@@ -44,12 +44,12 @@ def build_ready_payload(settings: Settings, db: DatabaseClient, vn: Any) -> tupl
         **training_status,
     }
 
-    ready = bool(ollama_status["ready"] and database_status["ready"] and training_payload["ready"])
+    ready = bool(glm_status["ready"] and database_status["ready"] and training_payload["ready"])
     payload = {
         "status": "ready" if ready else "not_ready",
         "timestamp": datetime.now(UTC).isoformat(),
         "checks": {
-            "ollama": ollama_status,
+            "glm": glm_status,
             "database": database_status,
             "training": training_payload,
         },

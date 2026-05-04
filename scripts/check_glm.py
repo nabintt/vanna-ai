@@ -8,44 +8,37 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.agent import inspect_ollama
+from app.agent import inspect_glm
 from app.config import get_settings
 
 
 def main() -> int:
     settings = get_settings()
-    diagnostics = inspect_ollama(settings)
+    diagnostics = inspect_glm(settings)
 
     if diagnostics["ready"]:
         print(
             json.dumps(
                 {
                     "status": "ready",
-                    "configured_host": diagnostics["configured_host"],
-                    "requested_models": diagnostics["requested_models"],
-                    "installed_models": diagnostics["installed_models"],
+                    "configured_model": diagnostics["configured_model"],
+                    "api_url": diagnostics.get("api_url"),
                 },
                 indent=2,
             )
         )
         return 0
 
-    if diagnostics["reachable"] is False:
+    if not diagnostics["configured"]:
         print(diagnostics["error"], file=sys.stderr)
         return 1
 
-    pull_commands = "\n".join(
-        f"ollama pull {model.removesuffix(':latest')}" for model in diagnostics["missing_models"]
-    )
     print(
         json.dumps(
             {
                 "status": "not_ready",
-                "configured_host": diagnostics["configured_host"],
-                "requested_models": diagnostics["requested_models"],
-                "installed_models": diagnostics["installed_models"],
-                "missing_models": diagnostics["missing_models"],
-                "hint": pull_commands,
+                "configured_model": diagnostics["configured_model"],
+                "error": diagnostics["error"],
             },
             indent=2,
         ),
