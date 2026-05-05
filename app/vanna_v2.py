@@ -38,6 +38,7 @@ from vanna.core.tool import Tool, ToolCall, ToolContext, ToolResult, ToolSchema
 from vanna.core.user import RequestContext, User
 from vanna.core.user.resolver import UserResolver
 from vanna.integrations.ollama import OllamaLlmService
+from vanna.integrations.openai.llm import OpenAILlmService
 from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -939,13 +940,24 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
         ReadOnlySqlTool(db=db, max_rows=settings.max_result_rows),
         access_groups=["user", "admin"],
     )
-    llm_service = OllamaToolCallFallbackService(
-        model=settings.normalized_ollama_model,
-        host=settings.ollama_host,
-        timeout=settings.ollama_timeout,
-        num_ctx=settings.ollama_num_ctx,
-        temperature=0.0,
-    )
+
+    backend = settings.normalized_llm_backend
+    if backend == "glm":
+        llm_service = OpenAILlmService(
+            model=settings.normalized_glm_model,
+            api_key=settings.glm_api_key,
+            base_url=settings.glm_api_url or "https://open.bigmodel.cn/api/paas/v4",
+        )
+        logger.info("Using GLM LLM backend: model=%s", settings.normalized_glm_model)
+    else:
+        llm_service = OllamaToolCallFallbackService(
+            model=settings.normalized_ollama_model,
+            host=settings.ollama_host,
+            timeout=settings.ollama_timeout,
+            num_ctx=settings.ollama_num_ctx,
+            temperature=0.0,
+        )
+        logger.info("Using Ollama LLM backend: model=%s", settings.normalized_ollama_model)
     agent = Agent(
         llm_service=llm_service,
         tool_registry=tool_registry,
@@ -1162,7 +1174,7 @@ def build_vanna_v2_index_html(settings: Settings) -> str:
             <p>{subtitle}</p>
             <div class="meta">
                 <span>UI: Vanna 2 web component</span>
-                <span>LLM: Ollama at {html_escape(settings.ollama_host)}</span>
+                <span>LLM: {html_escape(settings.normalized_llm_backend)} ({html_escape(settings.normalized_glm_model if settings.normalized_llm_backend == "glm" else settings.normalized_ollama_model)})</span>
                 <span>DB: {html_escape(settings.database_target)}</span>
             </div>
         </section>

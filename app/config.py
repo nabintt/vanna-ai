@@ -34,12 +34,21 @@ class Settings(BaseSettings):
         validation_alias="VANNA_UI_CDN_URL",
     )
 
+    # LLM backend selection: "ollama" or "glm"
+    llm_backend: str = Field(default="ollama", validation_alias="LLM_BACKEND")
+
     # GLM / ZhipuAI settings
     glm_api_key: str = Field(default="", validation_alias="GLM_API_KEY")
     glm_model: str = Field(default="glm-4", validation_alias="GLM_MODEL")
     glm_api_url: str | None = Field(default=None, validation_alias="GLM_API_URL")
     glm_embed_model: str = Field(default="embedding-2", validation_alias="GLM_EMBED_MODEL")
     glm_timeout: float = Field(default=120.0, validation_alias="GLM_TIMEOUT")
+
+    # Ollama settings
+    ollama_host: str = Field(default="http://localhost:11434", validation_alias="OLLAMA_HOST")
+    ollama_model: str = Field(default="deepseek-r1-16k:latest", validation_alias="OLLAMA_MODEL")
+    ollama_timeout: float = Field(default=120.0, validation_alias="OLLAMA_TIMEOUT")
+    ollama_num_ctx: int = Field(default=8192, validation_alias="OLLAMA_NUM_CTX")
 
     db_type: str = Field(default="postgres", validation_alias="DB_TYPE")
     db_host: str = Field(default="localhost", validation_alias="DB_HOST")
@@ -87,12 +96,20 @@ class Settings(BaseSettings):
     )
 
     @property
+    def normalized_llm_backend(self) -> str:
+        return self.llm_backend.strip().lower()
+
+    @property
     def normalized_glm_model(self) -> str:
         return self.glm_model.strip()
 
     @property
     def normalized_glm_embed_model(self) -> str:
         return self.glm_embed_model.strip()
+
+    @property
+    def normalized_ollama_model(self) -> str:
+        return self.ollama_model.strip()
 
     @property
     def normalized_db_type(self) -> str:
