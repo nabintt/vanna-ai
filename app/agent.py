@@ -4,7 +4,7 @@ import logging
 from typing import Any
 
 from vanna.legacy.chromadb import ChromaDB_VectorStore
-from vanna.legacy.ZhipuAI import ZhipuAI_Chat, ZhipuAIEmbeddingFunction
+from vanna.legacy.ZhipuAI import ZhipuAI_Chat
 
 from app.config import Settings
 
@@ -65,11 +65,6 @@ def create_vanna_agent(settings: Settings) -> LocalChromaGLMVanna:
 
     if settings.glm_api_url:
         config["api_url"] = settings.glm_api_url
-
-    # Use ZhipuAI embedding function
-    config["embedding_function"] = ZhipuAIEmbeddingFunction(
-        config={"api_key": settings.glm_api_key, "model_name": settings.normalized_glm_embed_model}
-    )
 
     logger.info("Creating Vanna agent with local Chroma persistence at %s", settings.chroma_path)
     logger.info("Using GLM model: %s", settings.normalized_glm_model)

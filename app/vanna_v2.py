@@ -30,7 +30,7 @@ from vanna.components import (
 from vanna import Agent, AgentConfig
 from vanna.core.enhancer import DefaultLlmContextEnhancer, LlmContextEnhancer
 from vanna.core.filter import ConversationFilter
-from vanna.core.llm import LlmMessage, LlmRequest, LlmResponse, LlmStreamChunk
+from vanna.core.llm import LlmMessage, LlmRequest, LlmResponse, LlmService, LlmStreamChunk
 from vanna.core.registry import ToolRegistry
 from vanna.core.storage import Message
 from vanna.core.system_prompt import SystemPromptBuilder
@@ -173,8 +173,8 @@ class SqlChatSystemPromptBuilder(SystemPromptBuilder):
                 "Treat each new standalone user question as a fresh request unless the user explicitly refers to a previous query, result, or instruction.",
                 "Call `run_sql` only when you still need information to answer the user.",
                 "When you make a tool call, the tool name must be exactly `run_sql` and the arguments must be `{\"sql\": \"...\"}`.",
-                "Make at most one SQL tool call per user request.",
-                "If the first successful SQL result already answers the question, stop calling tools and answer directly.",
+                "Generate the correct SQL on your first attempt using the provided schema. Do NOT make a second tool call unless the first query failed with an error.",
+                "After receiving a successful SQL result, immediately respond with your answer as plain text. Do NOT call run_sql again.",
                 "Do not return JSON unless you are making a tool call.",
                 "The user can already see the query result table, so your final answer should summarize only the answer, key figures, and caveats.",
                 f"Available tools: {tool_names}",
@@ -230,11 +230,12 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
             simple_component=SimpleTextComponent(text=description),
         )
 
-        llm_lines = [
-            "SQL executed successfully. Use this result to answer the user's question.",
-            "Do not run another SQL query if this already answers the question.",
-            description,
-        ]
+        llm_lines = []
+        if result.rows:
+            llm_lines.append("SQL executed successfully. STOP. Respond with your answer now. Do NOT call run_sql again.")
+        else:
+            llm_lines.append("SQL query returned no rows. You may try a different query.")
+        llm_lines.append(description)
         if result.columns:
             llm_lines.append(f"Columns: {', '.join(result.columns)}")
         if result.rows:
@@ -245,10 +246,6 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
                     json.dumps(result.rows[:10], default=str, indent=2),
                     "```",
                 ]
-            )
-        else:
-            llm_lines.append(
-                "No rows were returned for this query. That only applies to this exact query."
             )
 
         return ToolResult(
@@ -318,7 +315,7 @@ class StandaloneQuestionConversationFilter(ConversationFilter):
             start_index = max(0, last_user_index - self.followup_window)
             return messages[start_index:]
 
-        return [messages[last_user_index]]
+        return messages[last_user_index:]
 
 
 class OllamaToolCallFallbackService(OllamaLlmService):
@@ -360,6 +357,49 @@ class OllamaToolCallFallbackService(OllamaLlmService):
             finish_reason=normalized.finish_reason,
             metadata=normalized.metadata,
         )
+
+
+class StopAfterSuccessfulToolCall(LlmService):
+    """Wrap an LLM service and strip tools from requests after a successful tool execution.
+
+    This prevents models that ignore "stop" instructions from looping endlessly.
+    """
+
+    def __init__(self, wrapped: LlmService):
+        self._wrapped = wrapped
+
+    @staticmethod
+    def _has_successful_tool_result(messages: list[LlmMessage]) -> bool:
+        # Only check tool results after the last user message,
+        # so old results from previous turns don't block new queries.
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].role == "user":
+                last_user_idx = i
+                break
+        if last_user_idx < 0:
+            return False
+        return any(
+            msg.role == "tool"
+            and msg.content
+            and "SQL executed successfully" in msg.content
+            for msg in messages[last_user_idx + 1:]
+        )
+
+    def _maybe_strip_tools(self, request: LlmRequest) -> LlmRequest:
+        if request.tools and self._has_successful_tool_result(request.messages):
+            request.tools = None
+        return request
+
+    async def send_request(self, request: LlmRequest) -> LlmResponse:
+        return await self._wrapped.send_request(self._maybe_strip_tools(request))
+
+    async def stream_request(self, request: LlmRequest) -> AsyncGenerator[LlmStreamChunk, None]:
+        async for chunk in self._wrapped.stream_request(self._maybe_strip_tools(request)):
+            yield chunk
+
+    async def validate_tools(self, tools: list[ToolSchema]) -> list[str]:
+        return await self._wrapped.validate_tools(tools)
 
 
 def coerce_text_tool_calls(
@@ -516,6 +556,12 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
                 "Use ONLY tables and columns listed here. Do not invent or guess names.",
                 self.full_schema.table_overview,
             ])
+            if self.full_schema.all_ddls:
+                prompt_parts.extend([
+                    "",
+                    "## Full DDL Statements",
+                ])
+                prompt_parts.extend(self.full_schema.all_ddls)
 
         schema_section = format_schema_context(context_bundle["related_ddl"])
         if schema_section:
@@ -943,20 +989,22 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
 
     backend = settings.normalized_llm_backend
     if backend == "glm":
-        llm_service = OpenAILlmService(
+        base_service = OpenAILlmService(
             model=settings.normalized_glm_model,
             api_key=settings.glm_api_key,
             base_url=settings.glm_api_url or "https://open.bigmodel.cn/api/paas/v4",
         )
+        llm_service = StopAfterSuccessfulToolCall(base_service)
         logger.info("Using GLM LLM backend: model=%s", settings.normalized_glm_model)
     else:
-        llm_service = OllamaToolCallFallbackService(
+        base_service = OllamaToolCallFallbackService(
             model=settings.normalized_ollama_model,
             host=settings.ollama_host,
             timeout=settings.ollama_timeout,
             num_ctx=settings.ollama_num_ctx,
             temperature=0.0,
         )
+        llm_service = StopAfterSuccessfulToolCall(base_service)
         logger.info("Using Ollama LLM backend: model=%s", settings.normalized_ollama_model)
     agent = Agent(
         llm_service=llm_service,
@@ -967,9 +1015,9 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
         llm_context_enhancer=SchemaAwareLlmContextEnhancer(
             vn, None, full_schema=build_full_database_schema(db, settings.normalized_db_type),
         ),
-        conversation_filters=[StandaloneQuestionConversationFilter()],
+        conversation_filters=[],
         config=AgentConfig(
-            max_tool_iterations=1,
+            max_tool_iterations=10,
             stream_responses=True,
             include_thinking_indicators=False,
         ),
