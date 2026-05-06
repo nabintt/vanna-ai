@@ -595,6 +595,21 @@ class SchemaAwareLlmContextEnhancer(LlmContextEnhancer):
             "- Make at most one SQL tool call for each user request.",
             "- If one SQL result answers the question, stop and respond directly.",
             "- If the schema context is insufficient, use a single read-only metadata query against `information_schema` instead of guessing.",
+            "",
+            "## Domain Context",
+            "This database contains data for the card game **Callbreak** (also known as Call Break or Lakadi).",
+            "All tables relate to Callbreak gameplay, players, matches, leaderboards, scores, and game statistics.",
+            "Key domain concepts:",
+            "- A **player** is a user who plays Callbreak. Tables with 'player' in the name hold player profiles, stats, and identifiers.",
+            "- A **match** or **game** represents a single Callbreak session. Tables with 'match', 'game', or 'round' hold gameplay data.",
+            "- A **leaderboard** ranks players by performance metrics like skill rating, win ratio, or score. Tables with 'leaderboard' hold ranking data.",
+            "- **Skill** or **skill_rating** is a numeric rating representing a player's ability. Higher is better.",
+            "- **Win ratio** is the percentage of games a player has won.",
+            "- A **bid** or **call** is the number of tricks a player commits to win in a round of Callbreak.",
+            "- **Tricks** are the individual rounds within a game where each player plays one card.",
+            "- **Score** typically refers to points earned in a match or across matches.",
+            "When the user asks about 'top players', 'rankings', 'best performers', or similar, look at leaderboard and player statistics tables.",
+            "When the user asks about 'gameplay', 'matches', or 'performance', look at match/game and round-related tables.",
         ]
 
         # Always inject full schema overview so the model knows ALL tables and columns
