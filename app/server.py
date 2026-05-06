@@ -34,6 +34,8 @@ class AppServices:
     db: DatabaseClient
     vn: Any
     vanna_v2_chat_handler: Any
+    conversation_state: Any
+    sql_tool: Any
     started_at: datetime
 
 
@@ -78,11 +80,14 @@ def build_services(settings: Settings | None = None) -> AppServices:
 
     training_total = training_state["training"]["total_entries"]
     log_startup_banner(settings, training_total)
+    chat_handler, conv_state, sql_tool = build_vanna_v2_chat_handler(vn, db, settings)
     return AppServices(
         settings=settings,
         db=db,
         vn=vn,
-        vanna_v2_chat_handler=build_vanna_v2_chat_handler(vn, db, settings),
+        vanna_v2_chat_handler=chat_handler,
+        conversation_state=conv_state,
+        sql_tool=sql_tool,
         started_at=datetime.now(UTC),
     )
 

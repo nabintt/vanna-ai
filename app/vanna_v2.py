@@ -39,11 +39,12 @@ from vanna.core.user import RequestContext, User
 from vanna.core.user.resolver import UserResolver
 from vanna.integrations.ollama import OllamaLlmService
 from vanna.integrations.openai.llm import OpenAILlmService
-from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse
+from vanna.servers.base import ChatHandler, ChatRequest, ChatResponse, ChatStreamChunk
 from starlette.concurrency import run_in_threadpool
 
 from app.config import Settings
 from app.db import DatabaseClient, DatabaseConnectionError, build_ddl_statements
+from app.training import add_question_sql_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,41 @@ class FullDatabaseSchema:
     table_overview: str
     all_ddls: list[str]
     table_count: int
+
+
+class ConversationState:
+    """Tracks the last successful query per conversation for feedback-based training."""
+
+    def __init__(self, vn: Any):
+        self._vn = vn
+        self._pending: dict[str, tuple[str, str]] = {}
+
+    def save_successful_query(self, conversation_id: str | None, question: str, sql: str) -> None:
+        key = conversation_id or "_default"
+        self._pending[key] = (question, sql)
+
+    def handle_feedback(self, conversation_id: str | None, feedback: str) -> tuple[bool, str]:
+        key = conversation_id or "_default"
+        entry = self._pending.pop(key, None)
+        if entry is None:
+            return False, "No pending query to give feedback on."
+
+        question, sql = entry
+        if feedback == "/correct":
+            try:
+                added = add_question_sql_if_missing(self._vn, question, sql)
+                if added:
+                    return True, f"Learned from this query. Saved to training data."
+                return True, "This query was already in training data."
+            except Exception as exc:
+                logger.warning("Failed to save training data: %s", exc, exc_info=True)
+                return False, f"Failed to save: {exc}"
+        else:
+            return False, "Query discarded. Try rephrasing your question."
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._pending)
 
 
 class NoOpAgentMemory(AgentMemory):
@@ -174,7 +210,7 @@ class SqlChatSystemPromptBuilder(SystemPromptBuilder):
                 "Call `run_sql` only when you still need information to answer the user.",
                 "When you make a tool call, the tool name must be exactly `run_sql` and the arguments must be `{\"sql\": \"...\"}`.",
                 "Generate the correct SQL on your first attempt using the provided schema. Do NOT make a second tool call unless the first query failed with an error.",
-                "After receiving a successful SQL result, immediately respond with your answer as plain text. Do NOT call run_sql again.",
+                "After receiving a successful SQL result, respond with your answer as plain text, then end your message by asking the user to reply /correct if the result is right or /wrong if it is wrong.",
                 "Do not return JSON unless you are making a tool call.",
                 "The user can already see the query result table, so your final answer should summarize only the answer, key figures, and caveats.",
                 f"Available tools: {tool_names}",
@@ -183,9 +219,18 @@ class SqlChatSystemPromptBuilder(SystemPromptBuilder):
 
 
 class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
-    def __init__(self, db: DatabaseClient, max_rows: int):
+    def __init__(self, db: DatabaseClient, max_rows: int, conversation_state: ConversationState | None = None):
         self.db = db
         self.max_rows = max_rows
+        self._conv_state = conversation_state
+        self._current_question: str | None = None
+        self._current_conversation_id: str | None = None
+
+    def set_current_question(self, question: str) -> None:
+        self._current_question = question
+
+    def set_conversation_id(self, conversation_id: str | None) -> None:
+        self._current_conversation_id = conversation_id
 
     @property
     def name(self) -> str:
@@ -216,6 +261,11 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
             + (" (truncated to the configured limit)." if result.truncated else ".")
             + f" Duration: {result.duration_ms} ms."
         )
+
+        if result.rows and self._conv_state and self._current_question:
+            self._conv_state.save_successful_query(
+                self._current_conversation_id, self._current_question, sql,
+            )
 
         ui_component = UiComponent(
             rich_component=DataFrameComponent(
@@ -979,11 +1029,13 @@ class LocalAdminUserResolver(UserResolver):
         )
 
 
-def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings) -> ChatHandler:
+def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings) -> tuple[ChatHandler, ConversationState]:
     agent_memory = NoOpAgentMemory()
     tool_registry = ToolRegistry()
+    conv_state = ConversationState(vn)
+    sql_tool = ReadOnlySqlTool(db=db, max_rows=settings.max_result_rows, conversation_state=conv_state)
     tool_registry.register_local_tool(
-        ReadOnlySqlTool(db=db, max_rows=settings.max_result_rows),
+        sql_tool,
         access_groups=["user", "admin"],
     )
 
@@ -1022,7 +1074,7 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
             include_thinking_indicators=False,
         ),
     )
-    return ChatHandler(agent)
+    return ChatHandler(agent), conv_state, sql_tool
 
 
 async def stream_with_keepalive(
@@ -1249,8 +1301,38 @@ def register_vanna_v2_routes(app: FastAPI, settings: Settings) -> None:
         chat_request: ChatRequest,
         http_request: Request,
     ) -> StreamingResponse:
+        services = get_services(http_request.app)
         chat_handler = get_chat_handler(http_request.app)
         chat_request.request_context = build_request_context(http_request, chat_request.metadata)
+
+        feedback = _extract_feedback(chat_request.message)
+        if feedback:
+            success, msg = services.conversation_state.handle_feedback(
+                chat_request.conversation_id, feedback,
+            )
+            level = "success" if success else "info"
+            chunk = ChatStreamChunk.from_component(
+                UiComponent(
+                    rich_component=NotificationComponent(
+                        type=ComponentType.NOTIFICATION,
+                        level=level,
+                        message=msg,
+                    ),
+                    simple_component=SimpleTextComponent(text=msg),
+                ),
+                conversation_id=chat_request.conversation_id or "",
+                request_id=chat_request.request_id or "",
+            )
+            async def feedback_stream() -> AsyncGenerator[str, None]:
+                yield f"data: {chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(
+                feedback_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            )
+
+        _prepare_tool_context(services, chat_request)
 
         async def generate() -> AsyncGenerator[str, None]:
             try:
@@ -1288,8 +1370,31 @@ def register_vanna_v2_routes(app: FastAPI, settings: Settings) -> None:
         chat_request: ChatRequest,
         http_request: Request,
     ) -> ChatResponse:
+        services = get_services(http_request.app)
         chat_handler = get_chat_handler(http_request.app)
         chat_request.request_context = build_request_context(http_request, chat_request.metadata)
+
+        feedback = _extract_feedback(chat_request.message)
+        if feedback:
+            success, msg = services.conversation_state.handle_feedback(
+                chat_request.conversation_id, feedback,
+            )
+            level = "success" if success else "info"
+            chunk = ChatStreamChunk.from_component(
+                UiComponent(
+                    rich_component=NotificationComponent(
+                        type=ComponentType.NOTIFICATION,
+                        level=level,
+                        message=msg,
+                    ),
+                    simple_component=SimpleTextComponent(text=msg),
+                ),
+                conversation_id=chat_request.conversation_id or "",
+                request_id=chat_request.request_id or "",
+            )
+            return ChatResponse.from_chunks([chunk])
+
+        _prepare_tool_context(services, chat_request)
         try:
             return await chat_handler.handle_poll(chat_request)
         except Exception as exc:
@@ -1299,6 +1404,7 @@ def register_vanna_v2_routes(app: FastAPI, settings: Settings) -> None:
     @app.websocket("/api/vanna/v2/chat_websocket")
     async def chat_websocket(websocket: WebSocket) -> None:
         await websocket.accept()
+        services = get_services(websocket.app)
         chat_handler = get_chat_handler(websocket.app)
 
         try:
@@ -1313,6 +1419,35 @@ def register_vanna_v2_routes(app: FastAPI, settings: Settings) -> None:
                     metadata=metadata,
                 )
                 chat_request = ChatRequest(**payload)
+
+                feedback = _extract_feedback(chat_request.message)
+                if feedback:
+                    success, msg = services.conversation_state.handle_feedback(
+                        chat_request.conversation_id, feedback,
+                    )
+                    level = "success" if success else "info"
+                    chunk = ChatStreamChunk.from_component(
+                        UiComponent(
+                            rich_component=NotificationComponent(
+                                type=ComponentType.NOTIFICATION,
+                                level=level,
+                                message=msg,
+                            ),
+                            simple_component=SimpleTextComponent(text=msg),
+                        ),
+                        conversation_id=chat_request.conversation_id or "",
+                        request_id=chat_request.request_id or "",
+                    )
+                    await websocket.send_json(chunk.model_dump())
+                    await websocket.send_json({
+                        "type": "completion",
+                        "data": {"status": "done"},
+                        "conversation_id": chat_request.conversation_id or "",
+                        "request_id": chat_request.request_id or "",
+                    })
+                    continue
+
+                _prepare_tool_context(services, chat_request)
 
                 async for chunk in chat_handler.handle_stream(chat_request):
                     await websocket.send_json(chunk.model_dump())
@@ -1345,6 +1480,27 @@ def get_chat_handler(app: FastAPI) -> ChatHandler:
     if services is None or getattr(services, "vanna_v2_chat_handler", None) is None:
         raise RuntimeError("Vanna 2 chat handler is not ready yet.")
     return services.vanna_v2_chat_handler
+
+
+def get_services(app: FastAPI):
+    services = getattr(app.state, "services", None)
+    if services is None:
+        raise RuntimeError("Services not ready yet.")
+    return services
+
+
+def _extract_feedback(message: str) -> str | None:
+    stripped = message.strip().lower()
+    if stripped in ("/correct", "/wrong"):
+        return stripped
+    return None
+
+
+def _prepare_tool_context(services: Any, chat_request: ChatRequest) -> None:
+    sql_tool = getattr(services, "sql_tool", None)
+    if sql_tool:
+        sql_tool.set_current_question(chat_request.message)
+        sql_tool.set_conversation_id(chat_request.conversation_id)
 
 
 def build_request_context(
