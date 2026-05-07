@@ -30,7 +30,7 @@ from vanna.components import (
 from vanna import Agent, AgentConfig
 from vanna.core.enhancer import DefaultLlmContextEnhancer, LlmContextEnhancer
 from vanna.core.filter import ConversationFilter
-from vanna.core.llm import LlmMessage, LlmRequest, LlmResponse, LlmService, LlmStreamChunk
+from vanna.core.llm import LlmMessage, LlmRequest, LlmResponse, LlmStreamChunk
 from vanna.core.registry import ToolRegistry
 from vanna.core.storage import Message
 from vanna.core.system_prompt import SystemPromptBuilder
@@ -209,10 +209,22 @@ class SqlChatSystemPromptBuilder(SystemPromptBuilder):
                 "Treat each new standalone user question as a fresh request unless the user explicitly refers to a previous query, result, or instruction.",
                 "Call `run_sql` only when you still need information to answer the user.",
                 "When you make a tool call, the tool name must be exactly `run_sql` and the arguments must be `{\"sql\": \"...\"}`.",
-                "Generate the correct SQL on your first attempt using the provided schema. Do NOT make a second tool call unless the first query failed with an error.",
-                "After receiving a successful SQL result, respond with your answer as plain text, then end your message by asking the user to reply /correct if the result is right or /wrong if it is wrong.",
+                "You may run exploratory queries (e.g. checking column types, array dimensions, sample data) to understand the data structure before writing the final query. These are NOT your final answer — continue until you have the query that fully answers the user's question.",
+                "Once you have run a query whose results directly and completely answer the user's question, respond with your answer as plain text, then end your message by asking the user to reply /correct if the result is right or /wrong if it is wrong. Do NOT run any more queries after that.",
                 "Do not return JSON unless you are making a tool call.",
                 "The user can already see the query result table, so your final answer should summarize only the answer, key figures, and caveats.",
+                "",
+                "## Query Optimization Rules (CRITICAL)",
+                "The tables contain millions of rows. You MUST write optimized queries:",
+                "- Write the SIMPLEST possible query that answers the question. Do NOT over-engineer simple requests.",
+                "- Always add LIMIT clauses. Use LIMIT 100 by default unless the user asks for all results or a specific count.",
+                "- Use WHERE clauses to filter early — never SELECT millions of rows and then filter in a subquery.",
+                "- Avoid unnecessary subqueries, CTEs, or JOINs when a simple query suffices.",
+                "- Use indexed columns (typically primary keys, id columns, and columns that appear in constraints) for filtering and joining.",
+                "- Do NOT use SELECT * — only select the columns the user needs.",
+                "- For counting, use COUNT(*) with a WHERE filter. For top-N, use ORDER BY ... LIMIT N.",
+                "- Only use GROUP BY when the question requires aggregation. A simple 'show me X' does not need GROUP BY.",
+                "- Only run exploratory queries when you genuinely cannot understand the schema from the provided DDL. If the schema is clear, write the final query directly.",
                 f"Available tools: {tool_names}",
             ]
         )
@@ -282,7 +294,7 @@ class ReadOnlySqlTool(Tool[RunSqlToolArgs]):
 
         llm_lines = []
         if result.rows:
-            llm_lines.append("SQL executed successfully. STOP. Respond with your answer now. Do NOT call run_sql again.")
+            llm_lines.append("SQL executed successfully and returned rows. If this result fully answers the user's question, respond with your answer now and ask for /correct or /wrong feedback. If you still need more data to answer the question, continue with another query.")
         else:
             llm_lines.append("SQL query returned no rows. You may try a different query.")
         llm_lines.append(description)
@@ -407,49 +419,6 @@ class OllamaToolCallFallbackService(OllamaLlmService):
             finish_reason=normalized.finish_reason,
             metadata=normalized.metadata,
         )
-
-
-class StopAfterSuccessfulToolCall(LlmService):
-    """Wrap an LLM service and strip tools from requests after a successful tool execution.
-
-    This prevents models that ignore "stop" instructions from looping endlessly.
-    """
-
-    def __init__(self, wrapped: LlmService):
-        self._wrapped = wrapped
-
-    @staticmethod
-    def _has_successful_tool_result(messages: list[LlmMessage]) -> bool:
-        # Only check tool results after the last user message,
-        # so old results from previous turns don't block new queries.
-        last_user_idx = -1
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].role == "user":
-                last_user_idx = i
-                break
-        if last_user_idx < 0:
-            return False
-        return any(
-            msg.role == "tool"
-            and msg.content
-            and "SQL executed successfully" in msg.content
-            for msg in messages[last_user_idx + 1:]
-        )
-
-    def _maybe_strip_tools(self, request: LlmRequest) -> LlmRequest:
-        if request.tools and self._has_successful_tool_result(request.messages):
-            request.tools = None
-        return request
-
-    async def send_request(self, request: LlmRequest) -> LlmResponse:
-        return await self._wrapped.send_request(self._maybe_strip_tools(request))
-
-    async def stream_request(self, request: LlmRequest) -> AsyncGenerator[LlmStreamChunk, None]:
-        async for chunk in self._wrapped.stream_request(self._maybe_strip_tools(request)):
-            yield chunk
-
-    async def validate_tools(self, tools: list[ToolSchema]) -> list[str]:
-        return await self._wrapped.validate_tools(tools)
 
 
 def coerce_text_tool_calls(
@@ -1056,22 +1025,20 @@ def build_vanna_v2_chat_handler(vn: Any, db: DatabaseClient, settings: Settings)
 
     backend = settings.normalized_llm_backend
     if backend == "glm":
-        base_service = OpenAILlmService(
+        llm_service = OpenAILlmService(
             model=settings.normalized_glm_model,
             api_key=settings.glm_api_key,
             base_url=settings.glm_api_url or "https://open.bigmodel.cn/api/paas/v4",
         )
-        llm_service = StopAfterSuccessfulToolCall(base_service)
         logger.info("Using GLM LLM backend: model=%s", settings.normalized_glm_model)
     else:
-        base_service = OllamaToolCallFallbackService(
+        llm_service = OllamaToolCallFallbackService(
             model=settings.normalized_ollama_model,
             host=settings.ollama_host,
             timeout=settings.ollama_timeout,
             num_ctx=settings.ollama_num_ctx,
             temperature=0.0,
         )
-        llm_service = StopAfterSuccessfulToolCall(base_service)
         logger.info("Using Ollama LLM backend: model=%s", settings.normalized_ollama_model)
     agent = Agent(
         llm_service=llm_service,
